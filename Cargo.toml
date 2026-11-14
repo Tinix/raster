@@ -2,5 +2,14 @@
 name = "raster"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+authors = ["Daniel Tinivella"]
+description = "A blazing-fast, Lua-extensible text editor built in Rust"
+license = "MIT"
+repository = "https://github.com/Tinix/raster"
+
+[[bin]]
+name = "ras"
+path = "src/main.rs"
 
 [dependencies]
