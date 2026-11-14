@@ -13,3 +13,7 @@ name = "ras"
 path = "src/main.rs"
 
 [dependencies]
+anyhow = "1.0.104"
+crossterm = "0.29.0"
+ratatui = "0.30.2"
+ropey = "1.6.1"
