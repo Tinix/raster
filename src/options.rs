@@ -68,9 +68,114 @@ pub const NAMES: &[&str] = &[
     "timeoutlen",
 ];
 
+/// Full name of an option, accepting Vim's short names (`nu`, `ts`).
+pub fn canonical(name: &str) -> Option<&'static str> {
+    let full = match name {
+        "nu" => "number",
+        "rnu" => "relativenumber",
+        "so" => "scrolloff",
+        "ts" => "tabstop",
+        "sw" => "shiftwidth",
+        "et" => "expandtab",
+        "ai" => "autoindent",
+        "tm" => "timeoutlen",
+        other => other,
+    };
+    NAMES.iter().copied().find(|n| *n == full)
+}
+
 impl Options {
+    /// Run the arguments of `:set`, like Vim: `nu`, `nonu`, `nu!`, `invnu`,
+    /// `nu?`, `nu&`, `ts=4`, `ts:4`, several separated by spaces. Returns
+    /// the text to show (for queries), or the first error.
+    pub fn set_from_ex(&mut self, args: &str) -> Result<Option<String>, String> {
+        let mut shown = Vec::new();
+        if args.trim().is_empty() {
+            // Like Vim, `:set` alone lists the options that differ from the defaults.
+            let defaults = Options::default();
+            for name in NAMES {
+                if self.get(name) != defaults.get(name) {
+                    shown.push(self.show(name));
+                }
+            }
+            return Ok(Some(if shown.is_empty() {
+                "--- Options ---".into()
+            } else {
+                shown.join("  ")
+            }));
+        }
+        for arg in args.split_whitespace() {
+            if let Some(text) = self.set_arg(arg)? {
+                shown.push(text);
+            }
+        }
+        Ok((!shown.is_empty()).then(|| shown.join("  ")))
+    }
+
+    fn set_arg(&mut self, arg: &str) -> Result<Option<String>, String> {
+        let unknown = || format!("E518: Unknown option: {arg}");
+        if let Some((name, value)) = arg.split_once(['=', ':']) {
+            let name = canonical(name).ok_or_else(unknown)?;
+            if let Some(Value::Bool(_)) = self.get(name) {
+                return Err(format!("E474: Invalid argument: {arg}"));
+            }
+            let n: i64 = value
+                .parse()
+                .map_err(|_| format!("E521: Number required after =: {arg}"))?;
+            self.set(name, Value::Int(n))
+                .map_err(|_| format!("E474: Invalid argument: {arg}"))?;
+            return Ok(None);
+        }
+        if let Some(name) = arg.strip_suffix('?') {
+            return Ok(Some(self.show(canonical(name).ok_or_else(unknown)?)));
+        }
+        if let Some(name) = arg.strip_suffix('&') {
+            let name = canonical(name).ok_or_else(unknown)?;
+            let default = Options::default().get(name).expect("known option");
+            self.set(name, default).expect("default is valid");
+            return Ok(None);
+        }
+        let (name, toggle) = match arg.strip_suffix('!') {
+            Some(n) => (n, true),
+            None => match arg.strip_prefix("inv") {
+                Some(n) if canonical(n).is_some() => (n, true),
+                _ => (arg, false),
+            },
+        };
+        if let Some(name) = canonical(name) {
+            return match self.get(name) {
+                Some(Value::Bool(b)) => {
+                    self.set(name, Value::Bool(if toggle { !b } else { true }))
+                        .expect("bool");
+                    Ok(None)
+                }
+                // `:set ts` shows a number option, like `:set ts?`.
+                _ if !toggle => Ok(Some(self.show(name))),
+                _ => Err(format!("E474: Invalid argument: {arg}")),
+            };
+        }
+        if let Some(name) = arg.strip_prefix("no").and_then(canonical)
+            && let Some(Value::Bool(_)) = self.get(name)
+        {
+            self.set(name, Value::Bool(false)).expect("bool");
+            return Ok(None);
+        }
+        Err(unknown())
+    }
+
+    /// `number` / `nonumber` / `tabstop=8`, as `:set` shows it.
+    fn show(&self, name: &str) -> String {
+        match self.get(name) {
+            Some(Value::Bool(true)) => format!("  {name}"),
+            Some(Value::Bool(false)) => format!("no{name}"),
+            Some(v) => format!("  {name}={v}"),
+            None => String::new(),
+        }
+    }
+
     /// Set option `name`. Errors name the option and the expected type.
     pub fn set(&mut self, name: &str, value: Value) -> Result<(), String> {
+        let name = canonical(name).unwrap_or(name);
         fn flag(name: &str, v: &Value) -> Result<bool, String> {
             match v {
                 Value::Bool(b) => Ok(*b),
@@ -101,6 +206,7 @@ impl Options {
 
     /// Read option `name`.
     pub fn get(&self, name: &str) -> Option<Value> {
+        let name = canonical(name)?;
         Some(match name {
             "number" => Value::Bool(self.number),
             "relativenumber" => Value::Bool(self.relativenumber),
@@ -184,5 +290,90 @@ mod tests {
         o.set("shiftwidth", Value::Int(0)).unwrap();
         o.set("tabstop", Value::Int(4)).unwrap();
         assert_eq!(o.indent_width(), 4);
+    }
+
+    fn ex(o: &mut Options, args: &str) -> Result<Option<String>, String> {
+        o.set_from_ex(args)
+    }
+
+    #[test]
+    fn set_number_long_and_short() {
+        let mut o = Options::default();
+        assert_eq!(ex(&mut o, "number"), Ok(None));
+        assert!(o.number);
+        ex(&mut o, "nonu").unwrap();
+        assert!(!o.number);
+        ex(&mut o, "nu").unwrap();
+        assert!(o.number);
+        ex(&mut o, "nonumber").unwrap();
+        assert!(!o.number);
+    }
+
+    #[test]
+    fn set_toggle_query_and_reset() {
+        let mut o = Options::default();
+        ex(&mut o, "nu!").unwrap();
+        assert!(o.number);
+        ex(&mut o, "invnu").unwrap();
+        assert!(!o.number);
+        assert_eq!(ex(&mut o, "nu?"), Ok(Some("nonumber".into())));
+        ex(&mut o, "rnu").unwrap();
+        assert_eq!(
+            ex(&mut o, "relativenumber?"),
+            Ok(Some("  relativenumber".into()))
+        );
+        ex(&mut o, "rnu&").unwrap();
+        assert!(!o.relativenumber);
+    }
+
+    #[test]
+    fn set_numbers() {
+        let mut o = Options::default();
+        ex(&mut o, "ts=4 sw:2 so=3").unwrap();
+        assert_eq!((o.tabstop, o.shiftwidth, o.scrolloff), (4, 2, 3));
+        assert_eq!(ex(&mut o, "ts"), Ok(Some("  tabstop=4".into())));
+        assert_eq!(
+            ex(&mut o, "ts? nu?"),
+            Ok(Some("  tabstop=4  nonumber".into()))
+        );
+        ex(&mut o, "ts&").unwrap();
+        assert_eq!(o.tabstop, 8);
+    }
+
+    #[test]
+    fn set_errors_like_vim() {
+        let mut o = Options::default();
+        assert_eq!(ex(&mut o, "foo"), Err("E518: Unknown option: foo".into()));
+        assert_eq!(ex(&mut o, "nots"), Err("E518: Unknown option: nots".into()));
+        assert_eq!(
+            ex(&mut o, "nu=1"),
+            Err("E474: Invalid argument: nu=1".into())
+        );
+        assert_eq!(
+            ex(&mut o, "ts=abc"),
+            Err("E521: Number required after =: ts=abc".into())
+        );
+        assert_eq!(
+            ex(&mut o, "ts=0"),
+            Err("E474: Invalid argument: ts=0".into())
+        );
+        assert_eq!(ex(&mut o, "ts!"), Err("E474: Invalid argument: ts!".into()));
+    }
+
+    #[test]
+    fn set_alone_lists_changed_options() {
+        let mut o = Options::default();
+        assert_eq!(ex(&mut o, ""), Ok(Some("--- Options ---".into())));
+        ex(&mut o, "nu ts=2").unwrap();
+        assert_eq!(ex(&mut o, ""), Ok(Some("  number    tabstop=2".into())));
+    }
+
+    #[test]
+    fn short_names_work_everywhere() {
+        let mut o = Options::default();
+        o.set("nu", Value::Bool(true)).unwrap();
+        assert_eq!(o.get("nu"), Some(Value::Bool(true)));
+        assert_eq!(canonical("ts"), Some("tabstop"));
+        assert_eq!(canonical("mouse"), None);
     }
 }

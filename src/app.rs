@@ -551,6 +551,13 @@ impl App {
                     self.should_quit = true;
                 }
             }
+            Command::Set(args) => {
+                let result = self.options.borrow_mut().set_from_ex(&args);
+                match result {
+                    Ok(shown) => self.message = shown,
+                    Err(e) => self.message = Some(e),
+                }
+            }
             Command::Unknown(s) if s.is_empty() => {}
             Command::Unknown(s) => {
                 self.message = Some(format!("E492: Not an editor command: {s}"));
@@ -1484,5 +1491,44 @@ mod tests {
         assert_eq!(a.row, 1);
         keys(&mut a, "ks");
         assert_eq!(a.mode, Mode::Insert);
+    }
+
+    fn ex(a: &mut App, cmd: &str) {
+        keys(a, &format!(":{cmd}"));
+        press(a, KeyCode::Enter);
+    }
+
+    #[test]
+    fn set_number_from_the_command_line_shows_line_numbers() {
+        let mut a = app("one\ntwo");
+        let (rows, ..) = render(&mut a, 12, 4);
+        assert_eq!(rows[0], "one         ");
+
+        ex(&mut a, "set nu");
+        let (rows, x, _) = render(&mut a, 12, 4);
+        assert_eq!(rows[0], "  1 one     ");
+        assert_eq!(rows[1], "  2 two     ");
+        assert_eq!(x, 4);
+
+        ex(&mut a, "set nonumber");
+        let (rows, ..) = render(&mut a, 12, 4);
+        assert_eq!(rows[0], "one         ");
+
+        ex(&mut a, "set number");
+        assert!(a.options.borrow().number);
+        ex(&mut a, "se nu?");
+        assert_eq!(a.message.as_deref(), Some("  number"));
+        ex(&mut a, "set nu!");
+        assert!(!a.options.borrow().number);
+    }
+
+    #[test]
+    fn set_errors_show_on_the_message_line() {
+        let mut a = app("");
+        ex(&mut a, "set mouse=a");
+        assert_eq!(a.message.as_deref(), Some("E518: Unknown option: mouse=a"));
+        ex(&mut a, "set ts=4 rnu");
+        assert_eq!(a.options.borrow().tabstop, 4);
+        assert!(a.options.borrow().relativenumber);
     }
 }
