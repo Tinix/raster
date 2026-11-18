@@ -9,5 +9,6 @@ pub mod command;
 pub mod history;
 pub mod keys;
 pub mod mode;
+pub mod options;
 pub mod ui;
 pub mod vim;
