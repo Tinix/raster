@@ -7,6 +7,7 @@ pub mod app;
 pub mod buffer;
 pub mod command;
 pub mod history;
+pub mod keymap;
 pub mod keys;
 pub mod mode;
 pub mod options;
