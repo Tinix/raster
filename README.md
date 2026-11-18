@@ -19,11 +19,37 @@ plus **flow**, a built-in plugin manager. Themes are plain Lua tables.
 
 Vim-style editing with Normal, Insert and Command modes, Dvorak-friendly
 default motions, and a Zellij-inspired interface: tab bar, colored status bar,
-key hints, panes and a floating terminal## Roadmap
+key hints, panes and a floating terminal.
+
+## Usage
+
+```sh
+cargo run --release -- path/to/file   # or: ras path/to/file
+```
+
+## Keys
+
+Defaults follow a Dvorak-friendly Vim layout. Leader is `<Space>`.
+The full mapping and what comes next is in [docs/keymaps.md](docs/keymaps.md).
+
+| Mode | Key | Action |
+|---|---|---|
+| Normal | `h` `t` `n` `s` / arrows | left, down, up, right |
+| Normal | `0` / `$` | start / end of line |
+| Normal | `i` / `a` | Insert before / after the cursor |
+| Normal | `:` | Command mode |
+| Normal | `<C-s>` | save |
+| Normal | `<Space>q` / `<Space>Q` | quit / quit discarding changes |
+| Insert | any char, `Enter`, `Backspace` | type, break line, delete |
+| Insert | `Esc` | back to Normal |
+| Command | `:w` | write |
+| Command | `:q` / `:q!` | quit / quit discarding changes |
+| Command | `:wq` / `:x` | write and quit |
+| Command | `Esc` | cancel |
 
 ## Roadmap
 
-- [ ] Open/save files, Normal/Insert/Command modes, basic motions
+- [x] Open/save files, Normal/Insert/Command modes, basic motions
 - [ ] Operators and motions (`dw`, `ciw`, `yy`, `p`), undo/redo
 - [ ] `init.lua` with the `raster.opt` / `raster.keymap` API
 - [ ] Lua themes, starting with `raster-violet`
