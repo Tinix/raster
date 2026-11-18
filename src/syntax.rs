@@ -122,7 +122,19 @@ impl Syntax {
             }
             let prev_ident = i > 0 && is_ident(line[i - 1]);
 
-            if self.line_comments.iter().any(|p| starts_with(line, i, p)) {
+            // A line comment, unless a longer span opens here (`--[[` in Lua).
+            let comment = self
+                .line_comments
+                .iter()
+                .filter(|p| starts_with(line, i, p))
+                .map(|p| p.chars().count())
+                .max();
+            let span_len = self
+                .span_at(line, i, prev_ident)
+                .map(|(_, s)| s.open.chars().count());
+            if let Some(n) = comment
+                && span_len.is_none_or(|s| s <= n)
+            {
                 push(&mut out, i..len, "Comment");
                 break;
             }
@@ -186,7 +198,13 @@ impl Syntax {
                 if let Some(g) = group {
                     push(&mut out, i..end, g);
                 }
-                after_definer = self.definers.contains(&word);
+                // `fn name`: the next word, if it comes right after (not
+                // Go's `func (s *T) Name`).
+                let next_word = line[end..]
+                    .iter()
+                    .find(|c| !c.is_whitespace())
+                    .is_some_and(|c| is_ident(*c));
+                after_definer = self.definers.contains(&word) && next_word;
                 i = end;
                 continue;
             }
@@ -579,5 +597,34 @@ mod tests {
         // Closing the comment on line 0 changes the lines below.
         b.insert(4, " */");
         assert_eq!(h.line(&s, &b, 1), vec![(5..7, "Keyword".to_string())]);
+    }
+
+    #[test]
+    fn longer_span_beats_line_comment() {
+        let s = Syntax {
+            line_comments: vec!["--".into()],
+            spans: vec![Span {
+                multiline: true,
+                ..span("--[[", "]]", "Comment")
+            }],
+            ..Syntax::default()
+        };
+        let (text, state) = marks(&s, "x --[[ block", None);
+        assert_eq!((text.as_str(), state), ("x [Comment:--[[ block]", Some(0)));
+        assert_eq!(hl(&s, "x -- line"), "x [Comment:-- line]");
+    }
+
+    #[test]
+    fn definer_only_names_the_next_word() {
+        let s = Syntax {
+            definers: vec!["func".into()],
+            call: Some("Function".into()),
+            ..Syntax::default()
+        };
+        assert_eq!(hl(&s, "func main"), "func [Function:main]");
+        assert_eq!(
+            hl(&s, "func (s *T) Start()"),
+            "func (s *T) [Function:Start]()"
+        );
     }
 }
