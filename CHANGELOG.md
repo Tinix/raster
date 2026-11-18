@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Themes: `raster-violet` (default) and `default`, `:colorscheme` / `:colo`, `raster.colorscheme`, `raster.theme.set` and user themes in `themes/<name>.lua`.
+- Syntax highlighting with a built-in lexer for Rust, Lua, Python, Go, Ruby, Elixir, Gleam and Markdown. New languages can be added with `raster.syntax.define`.
+- The status bar shows the filetype.
+
+### Added
+
 - Word motions `w` `b` `e` and `W` `B` `E`, plus `^`, `gg`, `G`, `{count}G`,
   `f{char}` and `F{char}`. Motions take counts (`3w`, `5t`).
 - `I`, `A`, `o` and `O` to enter Insert mode (`o`/`O` keep the indent).
