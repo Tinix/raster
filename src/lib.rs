@@ -6,5 +6,7 @@
 pub mod app;
 pub mod buffer;
 pub mod command;
+pub mod history;
 pub mod mode;
 pub mod ui;
+pub mod vim;

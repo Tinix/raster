@@ -9,7 +9,8 @@ brings each one in.
 `<Space>` itself does nothing in Normal mode.
 
 Status: **done** = in Raster today; **step N** = planned for roadmap step N;
-**—** = out of scope (it belongs to an nvim plugin Raster will not ship).
+**later** = wanted but not on a step yet; **not yet** = blocked on the
+`t`/`n`/`s` conflict above.
 
 Roadmap steps: 1 skeleton · 2 operators, motions, undo/redo ·
 3 `init.lua` / `raster.keymap` · 4 Lua themes · 5 buffers, tabs, splits,
@@ -22,22 +23,47 @@ nvim remaps `t`/`n`/`s` to `j`/`k`/`l`, so Vim's original `t` (till),
 
 | nvim key | Action | Raster |
 |---|---|---|
-| `h` | left | done (Normal) · step 2 (Visual) |
-| `t` | down (`j`) | done (Normal) · step 2 (Visual) |
-| `n` | up (`k`) | done (Normal) · step 2 (Visual) |
-| `s` | right (`l`) | done (Normal) · step 2 (Visual) |
+| `h` | left | done (Normal, with operators) · later (Visual) |
+| `t` | down (`j`) | done (Normal, with operators) · later (Visual) |
+| `n` | up (`k`) | done (Normal, with operators) · later (Visual) |
+| `s` | right (`l`) | done (Normal, with operators) · later (Visual) |
 | arrows | move (built-in) | done (Normal and Insert) |
-| `0` / `$` | start / end of line (built-in) | done |
 
-## Modes and editing (Vim built-ins)
+**Operator-pending note.** The nvim config remaps `h t n s` only in Normal
+and Visual mode (`"n"`, `"v"`), not in operator-pending mode (`"o"`). So in
+nvim, `dt,` is still Vim's "delete till `,`". Raster uses the Dvorak motions
+after operators too: `dt` deletes the current line and the one below (like
+`dj`), and `ds` deletes one char (like `dl`). Until the conflict is decided,
+Vim's till (`t`/`T`), next match (`n`/`N`) and substitute (`s`) are not
+available.
+
+## Vim editing core (built-ins, step 2)
+
+Everything here takes a count (`3w`, `5t`, `2dd`, `d3w`, `2d3w` = 6 words).
 
 | Key | Action | Raster |
 |---|---|---|
-| `i` / `a` | Insert before / after the cursor | done |
+| `w` `b` `e` / `W` `B` `E` | word / WORD forward, back, end | done |
+| `0` `^` `$` | line start, first non-blank, line end | done |
+| `gg` / `G` / `{count}G` | first line / last line / line N | done |
+| `f{char}` / `F{char}` | find char forward / backward on the line | done |
+| `i` `a` `I` `A` | Insert at cursor, after, first non-blank, line end | done |
+| `o` / `O` | open line below / above (keeps indent) | done |
 | `Esc` | back to Normal | done |
 | `Enter` / `Backspace` (Insert) | break line / delete back | done |
+| `d` `c` `y` + motion | delete, change, yank (`dw`, `ce`, `y$`, `dfx`, `dgg`) | done |
+| `iw` `aw` / `iW` `aW` | inner / a word or WORD (`diw`, `caw`) | done |
+| `dd` `cc` `yy` | delete, change (keeps indent), yank lines | done |
+| `x` / `D` / `C` | `dl` / `d$` / `c$` | done |
+| `p` / `P` | put after / before (unnamed register) | done |
+| `.` | repeat last change, a count replaces its count | done |
+| `u` / `<C-r>` | undo / redo; each Insert session is one step | done |
 | `:` | Command mode | done |
-| `dw`, `ciw`, `yy`, `p`, `u`, `<C-r>` | operators, yank/put, undo/redo | step 2 |
+| `t` `T` `;` `,` | till char, repeat find | not yet (`t` conflict) |
+| `n` `N` `/` `?` | search | not yet (`n` conflict) |
+| `s` | substitute char | not yet (`s` conflict) |
+| `v` `V` | Visual mode | later |
+| `"{reg}` | named registers; nvim uses `clipboard=unnamedplus` | later |
 
 ## Files and quitting
 
@@ -52,10 +78,10 @@ nvim remaps `t`/`n`/`s` to `j`/`k`/`l`, so Vim's original `t` (till),
 
 | nvim key | Mode | Action | Raster |
 |---|---|---|---|
-| `<S-A-j>` / `<C-S-j>` / `<S-A-t>` | n, v | move line or selection down | step 2 |
-| `<S-A-k>` / `<C-S-k>` / `<S-A-n>` | n, v | move line or selection up | step 2 |
-| `<` / `>` | v | indent and keep the selection (`<gv` / `>gv`) | step 2 |
-| `p` | v | paste over selection without yanking (`"_dP`) | step 2 |
+| `<S-A-j>` / `<C-S-j>` / `<S-A-t>` | n, v | move line or selection down | later |
+| `<S-A-k>` / `<C-S-k>` / `<S-A-n>` | n, v | move line or selection up | later |
+| `<` / `>` | v | indent and keep the selection (`<gv` / `>gv`) | later (Visual) |
+| `p` | v | paste over selection without yanking (`"_dP`) | later (Visual) |
 
 ## Windows and buffers
 

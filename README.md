@@ -35,8 +35,16 @@ The full mapping and what comes next is in [docs/keymaps.md](docs/keymaps.md).
 | Mode | Key | Action |
 |---|---|---|
 | Normal | `h` `t` `n` `s` / arrows | left, down, up, right |
-| Normal | `0` / `$` | start / end of line |
-| Normal | `i` / `a` | Insert before / after the cursor |
+| Normal | `w` `b` `e` / `W` `B` `E` | word / WORD forward, back, end |
+| Normal | `0` `^` `$` | line start, first non-blank, line end |
+| Normal | `gg` / `G` / `{count}G` | first / last / Nth line |
+| Normal | `f{char}` / `F{char}` | find char forward / backward |
+| Normal | `i` `a` `I` `A` `o` `O` | enter Insert (cursor, after, line start/end, new line) |
+| Normal | `d` `c` `y` + motion or `iw` `aw` | delete, change, yank |
+| Normal | `dd` `cc` `yy`, `x` `D` `C` | linewise ops, delete char, to end of line |
+| Normal | `p` / `P` | put after / before |
+| Normal | `.` | repeat last change |
+| Normal | `u` / `<C-r>` | undo / redo |
 | Normal | `:` | Command mode |
 | Normal | `<C-s>` | save |
 | Normal | `<Space>q` / `<Space>Q` | quit / quit discarding changes |
@@ -47,10 +55,12 @@ The full mapping and what comes next is in [docs/keymaps.md](docs/keymaps.md).
 | Command | `:wq` / `:x` | write and quit |
 | Command | `Esc` | cancel |
 
+Motions and operators take counts: `3w`, `5t`, `2dd`, `d3w`.
+
 ## Roadmap
 
 - [x] Open/save files, Normal/Insert/Command modes, basic motions
-- [ ] Operators and motions (`dw`, `ciw`, `yy`, `p`), undo/redo
+- [x] Operators and motions (`dw`, `ciw`, `yy`, `p`), undo/redo
 - [ ] `init.lua` with the `raster.opt` / `raster.keymap` API
 - [ ] Lua themes, starting with `raster-violet`
 - [ ] Buffers, tabs, splits and the status bar
