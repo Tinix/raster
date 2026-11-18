@@ -12,5 +12,6 @@ pub mod keymap;
 pub mod keys;
 pub mod mode;
 pub mod options;
+pub mod theme;
 pub mod ui;
 pub mod vim;
