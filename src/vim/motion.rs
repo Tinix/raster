@@ -143,7 +143,7 @@ fn repeat(
 
 /// Character class for word motions: 0 blank, 1 word, 2 punctuation.
 /// With `big` (WORD motions), every non-blank is the same class.
-fn class(c: char, big: bool) -> u8 {
+pub(crate) fn class(c: char, big: bool) -> u8 {
     if c.is_whitespace() {
         0
     } else if big || c.is_alphanumeric() || c == '_' {
