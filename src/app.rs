@@ -4,7 +4,10 @@ use crate::{
     buffer::Buffer,
     command::Command,
     history::History,
+    keymap::{Keymap, MapMode, Match, Rhs},
+    keys::Key,
     mode::Mode,
+    options::Options,
     ui::{self, Status},
     vim::{
         motion::Motion,
@@ -19,6 +22,11 @@ use ratatui::{
     layout::{Constraint, Layout, Position},
     text::Line,
     widgets::Paragraph,
+};
+use std::{
+    cell::RefCell,
+    rc::Rc,
+    time::{Duration, Instant},
 };
 
 /// The last change, kept for `.` repeat: the command plus the keys typed in
@@ -58,6 +66,14 @@ pub struct App {
     insert_keys: Vec<KeyEvent>,
     /// Replaying a change with `.`: don't record it again.
     replaying: bool,
+    /// Key mappings, shared with the Lua config.
+    pub keymap: Rc<RefCell<Keymap>>,
+    /// Editor options, shared with the Lua config.
+    pub options: Rc<RefCell<Options>>,
+    /// Typed keys that may still become a mapping.
+    pending_keys: Vec<Key>,
+    /// When the first pending key was typed (for `timeoutlen`).
+    pending_since: Option<Instant>,
 }
 
 impl App {
@@ -72,6 +88,13 @@ impl App {
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         while !self.should_quit {
             terminal.draw(|f| self.draw(f))?;
+            // While a mapping is half typed, wait at most `timeoutlen`.
+            if let Some(wait) = self.map_timeout()
+                && !event::poll(wait)?
+            {
+                self.resolve_pending(true);
+                continue;
+            }
             if let Event::Key(key) = event::read()?
                 && key.kind == KeyEventKind::Press
             {
@@ -81,7 +104,87 @@ impl App {
         Ok(())
     }
 
+    /// Time left before a half-typed mapping resolves, if one is pending.
+    pub fn map_timeout(&self) -> Option<Duration> {
+        let since = self.pending_since?;
+        let total = Duration::from_millis(self.options.borrow().timeoutlen);
+        Some(total.saturating_sub(since.elapsed()))
+    }
+
+    /// Mappings that apply to the next key, if any.
+    fn map_mode(&self) -> Option<MapMode> {
+        match self.mode {
+            Mode::Normal => self.parser.map_mode(),
+            Mode::Insert => Some(MapMode::Insert),
+            Mode::Command => None,
+        }
+    }
+
+    /// Handle a typed key: match it against the keymap, then run it.
     pub fn handle_key(&mut self, key: KeyEvent) {
+        if self.map_mode().is_none() && self.pending_keys.is_empty() {
+            self.dispatch(key);
+            return;
+        }
+        self.pending_keys.push(Key::from(key));
+        self.pending_since.get_or_insert_with(Instant::now);
+        self.resolve_pending(false);
+    }
+
+    /// Turn pending keys into mappings or plain keys until they are used up
+    /// or form the start of a longer mapping. `timed_out` stops waiting.
+    pub fn resolve_pending(&mut self, mut timed_out: bool) {
+        while !self.pending_keys.is_empty() {
+            let Some(mode) = self.map_mode() else {
+                let key = self.pending_keys.remove(0);
+                self.dispatch(key.event());
+                continue;
+            };
+            let found = self
+                .keymap
+                .borrow()
+                .matches(mode, &self.pending_keys, timed_out);
+            match found {
+                Match::Wait => return,
+                Match::Mapped { rhs, len } => {
+                    self.pending_keys.drain(..len);
+                    self.run_rhs(rhs);
+                }
+                Match::Unmapped => {
+                    let key = self.pending_keys.remove(0);
+                    self.dispatch(key.event());
+                }
+            }
+            timed_out = false;
+        }
+        self.pending_since = None;
+    }
+
+    /// Run a mapping's right-hand side. Its keys are not remapped.
+    fn run_rhs(&mut self, rhs: Rhs) {
+        match rhs {
+            Rhs::Keys(tokens) => {
+                let keys = self.keymap.borrow().resolve(&tokens);
+                self.feed_keys(&keys);
+            }
+            Rhs::Lua(id) => self.call_lua(id),
+        }
+    }
+
+    /// Feed keys as if typed, without mappings.
+    pub fn feed_keys(&mut self, keys: &[Key]) {
+        for key in keys {
+            self.dispatch(key.event());
+        }
+    }
+
+    /// Call a Lua mapping. Wired to the config runtime in [`crate::config`].
+    fn call_lua(&mut self, _id: usize) {
+        self.message = Some("Lua mappings need init.lua support".into());
+    }
+
+    /// Run a key without mappings.
+    fn dispatch(&mut self, key: KeyEvent) {
         match self.mode {
             Mode::Normal => {
                 if let Step::Done(cmd) = self.parser.feed(key) {
@@ -118,7 +221,6 @@ impl App {
                 self.cmdline.clear();
                 self.message = None;
             }
-            Cmd::Ex(c) => self.execute(c),
             Cmd::Operate {
                 op: Operator::Yank,
                 count,
@@ -946,5 +1048,109 @@ mod tests {
         esc(&mut a);
         keys(&mut a, "s");
         assert_eq!((text(&a).as_str(), a.col), ("abc", 1));
+    }
+
+    #[test]
+    fn dvorak_maps_apply_in_normal_but_not_after_operators() {
+        // `dt,` is Vim's "delete till", as in the nvim config.
+        let mut a = app("foo, bar\nnext");
+        keys(&mut a, "dt,");
+        assert_eq!(text(&a), ", bar\nnext");
+        // `t` alone still moves down, with counts too.
+        let mut a = app("a\nb\nc\nd");
+        keys(&mut a, "2t");
+        assert_eq!(a.row, 2);
+        keys(&mut a, "n");
+        assert_eq!(a.row, 1);
+    }
+
+    #[test]
+    fn vim_builtins_under_the_maps() {
+        let mut a = app("a(b, c)");
+        keys(&mut a, "$T(");
+        assert_eq!(a.col, 2);
+        keys(&mut a, "jkl");
+        assert_eq!(a.col, 3);
+        let mut a = app("abc\n  def");
+        keys(&mut a, "tSx");
+        esc(&mut a);
+        assert_eq!(text(&a), "abc\n  x");
+    }
+
+    #[test]
+    fn char_arguments_are_not_remapped() {
+        let mut a = app("xtx");
+        keys(&mut a, "ft");
+        assert_eq!(a.col, 1);
+        let mut a = app("a s b");
+        keys(&mut a, "dfs");
+        assert_eq!(text(&a), " b");
+    }
+
+    #[test]
+    fn command_line_is_not_remapped() {
+        let mut a = app("");
+        keys(&mut a, ":tns");
+        assert_eq!(a.cmdline, "tns");
+    }
+
+    #[test]
+    fn leader_waits_and_times_out() {
+        let mut a = app("abc");
+        keys(&mut a, " ");
+        assert!(a.map_timeout().is_some());
+        assert_eq!(a.col, 0);
+        a.resolve_pending(true);
+        // `<Space>` is `<Nop>`: the cursor did not move.
+        assert_eq!(a.col, 0);
+        assert!(a.map_timeout().is_none());
+        // A key that breaks the sequence runs `<Space>`, then itself.
+        keys(&mut a, " s");
+        assert_eq!(a.col, 1);
+    }
+
+    #[test]
+    fn user_mappings_override_defaults() {
+        let mut a = app("a\nb\nc");
+        a.keymap.borrow_mut().set_keys("n", "t", "G", None).unwrap();
+        keys(&mut a, "t");
+        assert_eq!(a.row, 2);
+        a.keymap
+            .borrow_mut()
+            .del(&[MapMode::Normal], &crate::keys::parse("t").unwrap())
+            .unwrap();
+        // Without the mapping, `t` is Vim's till again.
+        keys(&mut a, "gg");
+        a.buffer.insert(0, "x,");
+        keys(&mut a, "dt,");
+        assert_eq!(text(&a), ",a\nb\nc");
+    }
+
+    #[test]
+    fn insert_mode_mappings() {
+        let mut a = app("");
+        a.keymap
+            .borrow_mut()
+            .set_keys("i", "jk", "<Esc>", None)
+            .unwrap();
+        keys(&mut a, "ihijk");
+        assert_eq!(a.mode, Mode::Normal);
+        assert_eq!(text(&a), "hi");
+        // A lone `j` is typed after the timeout.
+        keys(&mut a, "aj");
+        assert_eq!(text(&a), "hi");
+        a.resolve_pending(true);
+        assert_eq!(text(&a), "hij");
+    }
+
+    #[test]
+    fn mapping_rhs_is_not_remapped() {
+        let mut a = app("a\nb\nc");
+        // `x` -> `t`: `t` must be Vim's till here, not the Dvorak `j`.
+        a.keymap.borrow_mut().set_keys("n", "x", "t", None).unwrap();
+        keys(&mut a, "x");
+        assert_eq!(a.row, 0);
+        keys(&mut a, "c");
+        assert_eq!(a.row, 0);
     }
 }
