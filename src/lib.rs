@@ -9,3 +9,4 @@ pub mod command;
 pub mod history;
 pub mod mode;
 pub mod ui;
+pub mod vim;
