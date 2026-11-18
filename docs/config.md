@@ -130,3 +130,51 @@ modifiers `C-`, `S-`, `A-` / `M-` (`<C-S-j>`). Names are case-insensitive.
 
 Lua functions queue these requests, and the editor runs them right after the
 function returns. Reading editor state from Lua (cursor, lines) comes later.
+
+## Themes
+
+Raster starts with the `raster-violet` theme (it needs a true color terminal). `default` uses the terminal's 16 colors.
+
+```lua
+raster.colorscheme("raster-violet")            -- or :colorscheme / :colo
+raster.theme.set("Comment", { fg = "#7f849c", italic = true })
+raster.theme.set("Todo", { link = "Comment" })  -- like nvim_set_hl
+print(raster.theme.name())
+```
+
+A user theme lives in `~/.config/raster/themes/<name>.lua` and returns a table of groups:
+
+```lua
+return {
+  Normal = { fg = "#e2dcf2", bg = "#1b1726" },
+  Keyword = { fg = "#cba6f7", bold = true },
+}
+```
+
+Groups the theme leaves out keep their `default` style. Group keys are `fg`, `bg`, `bold`, `italic`, `underline` and `link`. Colors can be `"#rrggbb"`, `"#rgb"`, a terminal color name or `"none"`.
+
+The groups are Normal, LineNr, CursorLineNr, StatusLine, StatusModified, ModeNormal, ModeInsert, ModeCommand, Comment, String, Number, Constant, Keyword, Type, Function, Operator, PreProc, Special, Title, Bold and Italic.
+
+## Syntax highlighting
+
+Built in: Rust, Lua, Python, Go, Ruby, Elixir, Gleam and Markdown (see `runtime/syntax/`). The filetype comes from the file name and is shown in the status bar. You can add or replace a language like this:
+
+```lua
+raster.syntax.define("toy", {
+  extensions = { "toy" },            -- also: filenames = { "Toyfile" }
+  line_comment = { ";" },
+  spans = { { '"', '"', "String", escape = "\\", multiline = true } },
+  words = { Keyword = { "do", "end" } },
+  sigils = { ["@"] = "Special" },    -- @name
+  line_rules = { ["#"] = "Title" },  -- whole line when it starts with #
+  capitalized = "Type",              -- Foo
+  call = "Function",                 -- foo(
+  definers = { "def" },              -- def name -> Function
+  macro_bang = "PreProc",            -- name!
+  ident_end = "?!",                  -- empty? save!
+  numbers = true,
+  operators = "+-*/=<>",
+})
+```
+
+Span options are `escape`, `multiline` and `max_len`. With `max_len`, the span only counts when it closes within that many chars. Unknown keys are errors.
