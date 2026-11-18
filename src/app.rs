@@ -3,9 +3,10 @@
 use crate::{
     buffer::Buffer,
     command::Command,
+    config::{Action, Config},
     history::History,
     keymap::{Keymap, MapMode, Match, Rhs},
-    keys::Key,
+    keys::{self, Key},
     mode::Mode,
     options::Options,
     ui::{self, Status},
@@ -75,6 +76,8 @@ pub struct App {
     pending_keys: Vec<Key>,
     /// When the first pending key was typed (for `timeoutlen`).
     pending_since: Option<Instant>,
+    /// Lua runtime for `init.lua` and Lua mappings.
+    config: Option<Config>,
 }
 
 impl App {
@@ -179,9 +182,55 @@ impl App {
         }
     }
 
-    /// Call a Lua mapping. Wired to the config runtime in [`crate::config`].
-    fn call_lua(&mut self, _id: usize) {
-        self.message = Some("Lua mappings need init.lua support".into());
+    /// Start the Lua runtime and run the config file at `path`, if any.
+    /// Errors end up on the message line; the editor starts anyway.
+    pub fn load_config(&mut self, path: Option<&std::path::Path>) {
+        let config = match Config::new(self.options.clone(), self.keymap.clone()) {
+            Ok(c) => c,
+            Err(e) => {
+                self.message = Some(format!("Lua: {e}"));
+                return;
+            }
+        };
+        let result = path.map_or(Ok(()), |p| config.load_file(p));
+        self.config = Some(config);
+        self.apply_lua_actions();
+        if let Err(e) = result {
+            self.message = Some(e);
+        }
+    }
+
+    /// Call a Lua mapping, then apply what it asked for.
+    fn call_lua(&mut self, id: usize) {
+        let result = match &self.config {
+            Some(config) => config.call(id),
+            None => Err("no Lua runtime".into()),
+        };
+        self.apply_lua_actions();
+        if let Err(e) = result {
+            self.message = Some(e);
+        }
+    }
+
+    fn apply_lua_actions(&mut self) {
+        let actions = self
+            .config
+            .as_ref()
+            .map(Config::take_actions)
+            .unwrap_or_default();
+        for action in actions {
+            match action {
+                Action::Cmd(cmd) => self.execute(Command::parse(&cmd)),
+                Action::Feed(notation) => {
+                    let leader = self.keymap.borrow().leader;
+                    match keys::parse_keys(&notation, leader) {
+                        Ok(keys) => self.feed_keys(&keys),
+                        Err(e) => self.message = Some(e),
+                    }
+                }
+                Action::Notify(msg) => self.message = Some(msg),
+            }
+        }
     }
 
     /// Run a key without mappings.
@@ -1345,5 +1394,95 @@ mod tests {
         press(&mut a, KeyCode::Enter);
         esc(&mut a);
         assert_eq!(text(&a), "  \n    foo");
+    }
+
+    fn with_config(text: &str, lua: &str) -> App {
+        let dir = std::env::temp_dir().join(format!(
+            "raster_app_cfg_{}_{}",
+            std::process::id(),
+            lua.len()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let init = dir.join("init.lua");
+        std::fs::write(&init, lua).unwrap();
+        let mut a = app(text);
+        a.load_config(Some(&init));
+        std::fs::remove_dir_all(dir).unwrap();
+        a
+    }
+
+    #[test]
+    fn init_lua_sets_options_and_maps() {
+        let mut a = with_config(
+            "a b c",
+            r#"
+            raster.g.mapleader = ","
+            raster.opt.number = true
+            raster.keymap.set("n", "<leader>d", "dw")
+            raster.keymap.set("i", "jk", "<Esc>")
+            "#,
+        );
+        assert!(a.options.borrow().number);
+        assert_eq!(a.message, None);
+        keys(&mut a, ",d");
+        assert_eq!(text(&a), "b c");
+        keys(&mut a, "ixjk");
+        assert_eq!((text(&a).as_str(), a.mode), ("xb c", Mode::Normal));
+        // Defaults now use the new leader too.
+        a.buffer.dirty = false;
+        keys(&mut a, ",q");
+        assert!(a.should_quit);
+    }
+
+    #[test]
+    fn lua_function_mappings_drive_the_editor() {
+        let mut a = with_config(
+            "one\ntwo",
+            r#"
+            raster.keymap.set("n", "<leader>x", function()
+              raster.feedkeys("dd")
+              raster.notify("deleted")
+            end)
+            raster.keymap.set("n", "Q", function() raster.cmd("q!") end)
+            raster.keymap.set("n", "E", function() error("nope") end)
+            "#,
+        );
+        keys(&mut a, " x");
+        assert_eq!(text(&a), "two");
+        assert_eq!(a.message.as_deref(), Some("deleted"));
+        keys(&mut a, "E");
+        assert_eq!(a.message.as_deref(), Some("init.lua:7: nope"));
+        keys(&mut a, "Q");
+        assert!(a.should_quit);
+    }
+
+    #[test]
+    fn init_lua_errors_show_but_keep_earlier_settings() {
+        let a = with_config(
+            "",
+            "raster.opt.number = true\nraster.opt.mouse = 'a'\nraster.opt.scrolloff = 5",
+        );
+        assert_eq!(
+            a.message.as_deref(),
+            Some("init.lua:2: unknown option 'mouse'")
+        );
+        assert!(a.options.borrow().number);
+        assert_eq!(a.options.borrow().scrolloff, 0);
+    }
+
+    #[test]
+    fn init_lua_can_restore_vim_keys() {
+        let mut a = with_config(
+            "x,y\nz",
+            r#"
+            for _, k in ipairs({ "t", "n", "s" }) do raster.keymap.del("n", k) end
+            "#,
+        );
+        keys(&mut a, "t,");
+        assert_eq!(a.col, 0);
+        keys(&mut a, "j");
+        assert_eq!(a.row, 1);
+        keys(&mut a, "ks");
+        assert_eq!(a.mode, Mode::Insert);
     }
 }
