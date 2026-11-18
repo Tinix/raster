@@ -3,7 +3,7 @@
 use crate::{
     buffer::Buffer,
     command::Command,
-    config::{Action, Config},
+    config::{Action, Config, Shared},
     history::History,
     keymap::{Keymap, MapMode, Match, Rhs},
     keys::{self, Key},
@@ -185,7 +185,12 @@ impl App {
     /// Start the Lua runtime and run the config file at `path`, if any.
     /// Errors end up on the message line; the editor starts anyway.
     pub fn load_config(&mut self, path: Option<&std::path::Path>) {
-        let config = match Config::new(self.options.clone(), self.keymap.clone()) {
+        let shared = Shared {
+            options: self.options.clone(),
+            keymap: self.keymap.clone(),
+            ..Shared::default()
+        };
+        let config = match Config::new(&shared) {
             Ok(c) => c,
             Err(e) => {
                 self.message = Some(format!("Lua: {e}"));
