@@ -54,6 +54,7 @@ The full mapping and what comes next is in [docs/keymaps.md](docs/keymaps.md).
 | Command | `:w` | write |
 | Command | `:q` / `:q!` | quit / quit discarding changes |
 | Command | `:wq` / `:x` | write and quit |
+| Command | `:set nu` / `:set nonu` | show / hide line numbers (also `:set number`, `:set nu!`, `:set ts=4`) |
 | Command | `Esc` | cancel |
 
 Motions and operators take counts: `3w`, `5t`, `2dd`, `d3w`.
