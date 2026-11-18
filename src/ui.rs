@@ -1,10 +1,11 @@
 //! UI: widgets drawn around the buffer.
 
-use crate::mode::Mode;
+use crate::{mode::Mode, theme::Theme};
 use ratatui::{
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
 };
+use std::ops::Range;
 
 /// Everything the status bar shows.
 #[derive(Debug, Clone, Copy)]
@@ -12,46 +13,90 @@ pub struct Status<'a> {
     pub mode: Mode,
     pub file_name: Option<&'a str>,
     pub dirty: bool,
+    /// Detected language, if any (`rust`).
+    pub filetype: Option<&'a str>,
     /// Zero-based cursor row.
     pub row: usize,
     /// Zero-based cursor column.
     pub col: usize,
 }
 
-/// Background color of the mode pill.
-pub fn mode_color(mode: Mode) -> Color {
+/// Highlight group of the mode pill.
+pub fn mode_group(mode: Mode) -> &'static str {
     match mode {
-        Mode::Normal => Color::Magenta,
-        Mode::Insert => Color::Green,
-        Mode::Command => Color::Yellow,
+        Mode::Normal => "ModeNormal",
+        Mode::Insert => "ModeInsert",
+        Mode::Command => "ModeCommand",
     }
 }
 
 /// Build the status bar line for a terminal `width` columns wide:
-/// `[ MODE ] name [+]` on the left, `row:col` (one-based) on the right.
-pub fn status_line(status: Status, width: u16) -> Line<'static> {
+/// `[ MODE ] name [+]` on the left, `filetype  row:col` (one-based) on the right.
+pub fn status_line(status: Status, width: u16, theme: &Theme) -> Line<'static> {
     let pill = Span::styled(
         format!(" {} ", status.mode.label()),
-        Style::default()
-            .fg(Color::Black)
-            .bg(mode_color(status.mode))
-            .add_modifier(Modifier::BOLD),
+        theme.style(mode_group(status.mode)),
     );
     let name = format!(" {}", status.file_name.unwrap_or("[No Name]"));
     let dirty = if status.dirty { " [+]" } else { "" };
-    let pos = format!("{}:{} ", status.row + 1, status.col + 1);
+    let right = match status.filetype {
+        Some(ft) => format!("{ft}  {}:{} ", status.row + 1, status.col + 1),
+        None => format!("{}:{} ", status.row + 1, status.col + 1),
+    };
 
-    let used = pill.width() + name.chars().count() + dirty.chars().count() + pos.chars().count();
+    let used = pill.width() + name.chars().count() + dirty.chars().count() + right.chars().count();
     let gap = (width as usize).saturating_sub(used);
 
-    let bar = Style::default().bg(Color::DarkGray).fg(Color::White);
+    let bar = theme.style("StatusLine");
     Line::from(vec![
         pill,
         Span::styled(name, bar.add_modifier(Modifier::BOLD)),
-        Span::styled(dirty.to_owned(), bar.fg(Color::Yellow)),
+        Span::styled(dirty.to_owned(), bar.patch(theme.style("StatusModified"))),
         Span::styled(" ".repeat(gap), bar),
-        Span::styled(pos, bar),
+        Span::styled(right, bar),
     ])
+}
+
+/// A line of text with highlighted char ranges, tabs expanded to `tabstop`.
+/// `highlights` must be sorted and not overlap.
+pub fn styled_line(
+    text: &str,
+    highlights: &[(Range<usize>, Style)],
+    tabstop: usize,
+) -> Line<'static> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut spans = Vec::new();
+    let mut width = 0;
+    let mut piece = |range: Range<usize>, style: Style, width: &mut usize| {
+        let mut out = String::new();
+        for &c in &chars[range] {
+            if c == '\t' {
+                let n = tabstop - *width % tabstop;
+                out.extend(std::iter::repeat_n(' ', n));
+                *width += n;
+            } else {
+                out.push(c);
+                *width += 1;
+            }
+        }
+        if !out.is_empty() {
+            spans.push(Span::styled(out, style));
+        }
+    };
+    let mut i = 0;
+    for (range, style) in highlights {
+        let start = range.start.min(chars.len()).max(i);
+        let end = range.end.min(chars.len());
+        piece(i..start, Style::default(), &mut width);
+        if start < end {
+            piece(start..end, *style, &mut width);
+            i = end;
+        } else {
+            i = start;
+        }
+    }
+    piece(i..chars.len(), Style::default(), &mut width);
+    Line::from(spans)
 }
 
 /// Expand tabs in `line` to spaces, with tab stops every `tabstop` columns.
@@ -125,15 +170,16 @@ mod tests {
             mode: Mode::Insert,
             file_name: Some("main.rs"),
             dirty: true,
+            filetype: Some("rust"),
             row: 2,
             col: 4,
         };
-        let line = status_line(status, 40);
+        let line = status_line(status, 40, &Theme::fallback());
         let s = text(&line);
         assert!(s.starts_with(" INSERT  main.rs [+]"));
-        assert!(s.ends_with("3:5 "));
+        assert!(s.ends_with("rust  3:5 "));
         assert_eq!(line.width(), 40);
-        assert_eq!(line.spans[0].style.bg, Some(Color::Green));
+        assert_eq!(line.spans[0].style.bg, Some(ratatui::style::Color::Green));
     }
 
     #[test]
@@ -142,10 +188,11 @@ mod tests {
             mode: Mode::Normal,
             file_name: None,
             dirty: false,
+            filetype: None,
             row: 0,
             col: 0,
         };
-        let s = text(&status_line(status, 10));
+        let s = text(&status_line(status, 10, &Theme::fallback()));
         assert!(s.contains("[No Name]"));
         assert!(!s.contains("[+]"));
     }
@@ -169,5 +216,30 @@ mod tests {
         assert_eq!(line_number(4, 2, true, true, 4), "  2 ");
         assert_eq!(line_number(2, 2, true, true, 4), "  3 ");
         assert_eq!(line_number(2, 2, false, true, 4), "  0 ");
+    }
+
+    #[test]
+    fn styled_line_splits_and_expands_tabs() {
+        use ratatui::style::Color;
+        let red = Style::default().fg(Color::Red);
+        let blue = Style::default().fg(Color::Blue);
+        let line = styled_line("\tfn x()", &[(1..3, red), (4..5, blue)], 4);
+        let parts: Vec<(String, Style)> = line
+            .spans
+            .iter()
+            .map(|s| (s.content.to_string(), s.style))
+            .collect();
+        assert_eq!(
+            parts,
+            vec![
+                ("    ".into(), Style::default()),
+                ("fn".into(), red),
+                (" ".into(), Style::default()),
+                ("x".into(), blue),
+                ("()".into(), Style::default()),
+            ]
+        );
+        // Out-of-range highlights are clipped.
+        assert_eq!(styled_line("ab", &[(1..9, red)], 4).width(), 2);
     }
 }

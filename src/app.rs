@@ -9,6 +9,8 @@ use crate::{
     keys::{self, Key},
     mode::Mode,
     options::Options,
+    syntax::{Highlighter, SyntaxSet},
+    theme::Theme,
     ui::{self, Status},
     vim::{
         motion::Motion,
@@ -21,9 +23,8 @@ use ratatui::{
     DefaultTerminal, Frame,
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     layout::{Constraint, Layout, Position},
-    style::{Color, Style},
     text::Line,
-    widgets::Paragraph,
+    widgets::{Block, Paragraph},
 };
 use std::{
     cell::RefCell,
@@ -78,6 +79,13 @@ pub struct App {
     pending_since: Option<Instant>,
     /// Lua runtime for `init.lua` and Lua mappings.
     config: Option<Config>,
+    /// Current theme, shared with the Lua config.
+    pub theme: Rc<RefCell<Theme>>,
+    /// Known syntaxes, shared with the Lua config.
+    pub syntaxes: Rc<RefCell<SyntaxSet>>,
+    /// Syntax of the buffer, detected from the file name.
+    pub filetype: Option<String>,
+    highlighter: Highlighter,
 }
 
 impl App {
@@ -188,7 +196,8 @@ impl App {
         let shared = Shared {
             options: self.options.clone(),
             keymap: self.keymap.clone(),
-            ..Shared::default()
+            theme: self.theme.clone(),
+            syntaxes: self.syntaxes.clone(),
         };
         let config = match Config::new(&shared) {
             Ok(c) => c,
@@ -199,7 +208,36 @@ impl App {
         };
         let result = path.map_or(Ok(()), |p| config.load_file(p));
         self.config = Some(config);
+        self.detect_filetype();
         self.apply_lua_actions();
+        if let Err(e) = result {
+            self.message = Some(e);
+        }
+    }
+
+    /// Pick the syntax for the buffer's file name.
+    pub fn detect_filetype(&mut self) {
+        self.filetype = self
+            .buffer
+            .path
+            .as_deref()
+            .and_then(|p| self.syntaxes.borrow().detect(p).map(|s| s.name.clone()));
+    }
+
+    /// `:colorscheme name`, or the current name without one.
+    fn colorscheme(&mut self, name: &str) {
+        if name.is_empty() {
+            self.message = Some(self.theme.borrow().name.clone());
+            return;
+        }
+        let result = match (&self.config, name) {
+            (Some(config), _) => config.colorscheme(name),
+            (None, "default") => {
+                *self.theme.borrow_mut() = Theme::fallback();
+                Ok(())
+            }
+            (None, _) => Err(format!("E185: Cannot find color scheme '{name}'")),
+        };
         if let Err(e) = result {
             self.message = Some(e);
         }
@@ -556,6 +594,7 @@ impl App {
                     self.should_quit = true;
                 }
             }
+            Command::Colorscheme(name) => self.colorscheme(&name),
             Command::Set(args) => {
                 let result = self.options.borrow_mut().set_from_ex(&args);
                 match result {
@@ -642,6 +681,10 @@ impl App {
     }
 
     fn draw(&mut self, frame: &mut Frame) {
+        let theme = self.theme.borrow().clone();
+        let normal = theme.style("Normal");
+        frame.render_widget(Block::default().style(normal), frame.area());
+
         let [text_area, status_area, cmd_area] = Layout::vertical([
             Constraint::Min(1),
             Constraint::Length(1),
@@ -661,19 +704,38 @@ impl App {
                 .buffer
                 .line_count()
                 .min(self.scroll + text_area.height as usize);
-        let lines: Vec<Line> = rows
-            .clone()
-            .map(|r| Line::raw(ui::expand_tabs(&self.line_text(r), opts.tabstop)))
-            .collect();
-        frame.render_widget(Paragraph::new(lines), text_area);
+        let syntaxes = self.syntaxes.clone();
+        let syntaxes = syntaxes.borrow();
+        let syntax = self.filetype.as_deref().and_then(|ft| syntaxes.get(ft));
+        let mut lines: Vec<Line> = Vec::with_capacity(rows.len());
+        for r in rows.clone() {
+            let text = self.line_text(r);
+            let highlights: Vec<_> = match syntax {
+                Some(syn) => self
+                    .highlighter
+                    .line(syn, &self.buffer, r)
+                    .into_iter()
+                    .map(|(range, group)| (range, theme.style(&group)))
+                    .collect(),
+                None => Vec::new(),
+            };
+            lines.push(ui::styled_line(&text, &highlights, opts.tabstop));
+        }
+        drop(syntaxes);
+        frame.render_widget(Paragraph::new(lines).style(normal), text_area);
         if gutter > 0 {
             let numbers: Vec<Line> = rows
                 .map(|r| {
                     let n = ui::line_number(r, self.row, opts.number, opts.relativenumber, gutter);
-                    Line::styled(n, Style::default().fg(Color::DarkGray))
+                    let group = if r == self.row {
+                        "CursorLineNr"
+                    } else {
+                        "LineNr"
+                    };
+                    Line::styled(n, theme.style(group))
                 })
                 .collect();
-            frame.render_widget(Paragraph::new(numbers), gutter_area);
+            frame.render_widget(Paragraph::new(numbers).style(normal), gutter_area);
         }
 
         let name = self.file_name();
@@ -681,19 +743,23 @@ impl App {
             mode: self.mode,
             file_name: name.as_deref(),
             dirty: self.buffer.dirty,
+            filetype: self.filetype.as_deref(),
             row: self.row,
             col: self.col,
         };
-        frame.render_widget(ui::status_line(status, status_area.width), status_area);
+        frame.render_widget(
+            ui::status_line(status, status_area.width, &theme),
+            status_area,
+        );
 
         if self.mode == Mode::Command {
             let text = format!(":{}", self.cmdline);
             let x = cmd_area.x + text.chars().count() as u16;
-            frame.render_widget(Line::raw(text), cmd_area);
+            frame.render_widget(Line::styled(text, normal), cmd_area);
             frame.set_cursor_position(Position::new(x, cmd_area.y));
         } else {
             if let Some(msg) = &self.message {
-                frame.render_widget(Line::raw(msg.clone()), cmd_area);
+                frame.render_widget(Line::styled(msg.clone(), normal), cmd_area);
             }
             let col = ui::display_col(&self.line_text(self.row), self.col, opts.tabstop);
             let x = text_area.x + col as u16;
@@ -1535,5 +1601,132 @@ mod tests {
         ex(&mut a, "set ts=4 rnu");
         assert_eq!(a.options.borrow().tabstop, 4);
         assert!(a.options.borrow().relativenumber);
+    }
+
+    /// An app editing `text` as if it came from the file `name`, with the
+    /// built-in runtime (theme and syntaxes) loaded.
+    fn app_for(name: &str, text: &str) -> App {
+        let mut a = app(text);
+        a.buffer.path = Some(name.into());
+        a.load_config(None);
+        a
+    }
+
+    fn screen(a: &mut App, w: u16, h: u16) -> ratatui::buffer::Buffer {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| a.draw(f)).unwrap();
+        t.backend().buffer().clone()
+    }
+
+    fn fg_at(buf: &ratatui::buffer::Buffer, x: u16, y: u16) -> ratatui::style::Color {
+        buf[(x, y)].fg
+    }
+
+    #[test]
+    fn rust_files_are_highlighted_with_the_theme() {
+        let mut a = app_for("main.rs", "fn main() { 42 }");
+        assert_eq!(a.filetype.as_deref(), Some("rust"));
+        let buf = screen(&mut a, 30, 3);
+        let theme = a.theme.borrow().clone();
+        assert_eq!(theme.name, "raster-violet");
+        assert_eq!(Some(fg_at(&buf, 0, 0)), theme.style("Keyword").fg);
+        assert_eq!(Some(fg_at(&buf, 3, 0)), theme.style("Function").fg);
+        assert_eq!(Some(fg_at(&buf, 12, 0)), theme.style("Number").fg);
+        // Normal's background fills the whole text area.
+        assert_eq!(Some(buf[(29, 0)].bg), theme.style("Normal").bg);
+        // The status bar shows the filetype.
+        let status: String = (0..30).map(|x| buf[(x, 1)].symbol()).collect();
+        assert!(status.contains("rust  1:1"), "{status}");
+    }
+
+    #[test]
+    fn unknown_files_are_plain() {
+        let mut a = app_for("notes.txt", "fn main");
+        assert_eq!(a.filetype, None);
+        let buf = screen(&mut a, 20, 3);
+        let normal = a.theme.borrow().style("Normal").fg;
+        assert_eq!(Some(fg_at(&buf, 0, 0)), normal);
+    }
+
+    #[test]
+    fn highlighting_follows_edits_across_lines() {
+        let mut a = app_for("a.rs", "/* x\nfn y");
+        let comment = a.theme.borrow().style("Comment").fg;
+        let keyword = a.theme.borrow().style("Keyword").fg;
+        let buf = screen(&mut a, 20, 4);
+        assert_eq!(Some(fg_at(&buf, 0, 1)), comment);
+        // Close the comment on line 1: `fn` on line 2 becomes a keyword.
+        keys(&mut a, "A */");
+        esc(&mut a);
+        let buf = screen(&mut a, 20, 4);
+        assert_eq!(Some(fg_at(&buf, 0, 1)), keyword);
+    }
+
+    #[test]
+    fn colorscheme_command() {
+        let mut a = app_for("main.rs", "fn main");
+        ex(&mut a, "colorscheme default");
+        assert_eq!(a.theme.borrow().name, "default");
+        let buf = screen(&mut a, 20, 3);
+        assert_eq!(fg_at(&buf, 0, 0), ratatui::style::Color::Magenta);
+        ex(&mut a, "colo nope");
+        assert_eq!(
+            a.message.as_deref(),
+            Some("E185: Cannot find color scheme 'nope'")
+        );
+        ex(&mut a, "colo raster-violet");
+        ex(&mut a, "colo");
+        assert_eq!(a.message.as_deref(), Some("raster-violet"));
+    }
+
+    #[test]
+    fn colorscheme_without_lua_only_knows_default() {
+        let mut a = app("x");
+        ex(&mut a, "colo default");
+        assert_eq!(a.message, None);
+        ex(&mut a, "colo raster-violet");
+        assert!(a.message.as_deref().unwrap().starts_with("E185"));
+    }
+
+    #[test]
+    fn init_lua_can_pick_theme_and_add_syntax() {
+        let mut a = app("do x end");
+        a.buffer.path = Some("prog.toy".into());
+        let dir = std::env::temp_dir().join(format!("raster_app_theme_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let init = dir.join("init.lua");
+        std::fs::write(
+            &init,
+            r##"
+            raster.colorscheme("default")
+            raster.theme.set("Keyword", { fg = "#123456" })
+            raster.syntax.define("toy", { extensions = { "toy" }, words = { Keyword = { "do", "end" } } })
+            "##,
+        )
+        .unwrap();
+        a.load_config(Some(&init));
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(a.message, None);
+        assert_eq!(a.filetype.as_deref(), Some("toy"));
+        let buf = screen(&mut a, 20, 3);
+        assert_eq!(
+            fg_at(&buf, 0, 0),
+            ratatui::style::Color::Rgb(0x12, 0x34, 0x56)
+        );
+        assert_eq!(
+            fg_at(&buf, 5, 0),
+            ratatui::style::Color::Rgb(0x12, 0x34, 0x56)
+        );
+    }
+
+    #[test]
+    fn line_numbers_use_theme_groups() {
+        let mut a = app_for("a.rs", "a\nb");
+        ex(&mut a, "set nu");
+        let buf = screen(&mut a, 20, 4);
+        let t = a.theme.borrow().clone();
+        assert_eq!(Some(fg_at(&buf, 2, 0)), t.style("CursorLineNr").fg);
+        assert_eq!(Some(fg_at(&buf, 2, 1)), t.style("LineNr").fg);
     }
 }

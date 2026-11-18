@@ -13,6 +13,8 @@ pub enum Command {
     WriteQuit,
     /// `:set {args}` / `:se {args}` — set or show options (`nu`, `ts=4`).
     Set(String),
+    /// `:colorscheme {name}` / `:colo {name}` — switch theme (empty: show it).
+    Colorscheme(String),
     /// Anything else.
     Unknown(String),
 }
@@ -22,8 +24,10 @@ impl Command {
     pub fn parse(input: &str) -> Self {
         let input = input.trim();
         let (name, args) = input.split_once(char::is_whitespace).unwrap_or((input, ""));
-        if name == "set" || name == "se" {
-            return Command::Set(args.trim().to_owned());
+        match name {
+            "set" | "se" => return Command::Set(args.trim().to_owned()),
+            "colorscheme" | "colo" => return Command::Colorscheme(args.trim().to_owned()),
+            _ => {}
         }
         match input {
             "w" | "write" => Command::Write,
@@ -58,6 +62,19 @@ mod tests {
         );
         assert_eq!(Command::parse("set"), Command::Set(String::new()));
         assert_eq!(Command::parse("setx"), Command::Unknown("setx".into()));
+    }
+
+    #[test]
+    fn parses_colorscheme() {
+        assert_eq!(
+            Command::parse("colorscheme raster-violet"),
+            Command::Colorscheme("raster-violet".into())
+        );
+        assert_eq!(
+            Command::parse("colo default"),
+            Command::Colorscheme("default".into())
+        );
+        assert_eq!(Command::parse("colo"), Command::Colorscheme(String::new()));
     }
 
     #[test]
