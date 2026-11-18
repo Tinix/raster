@@ -42,7 +42,26 @@ print(raster.opt.tabstop)  --> 8
 | `timeoutlen` | integer (ms) | `1000` | wait for the rest of a mapped key sequence |
 
 Defaults are nvim's. Setting an unknown option or a value of the wrong type
-is an error.
+is an error. Vim's short names work too: `nu`, `rnu`, `so`, `ts`, `sw`, `et`,
+`ai`, `tm` (`raster.opt.nu = true`).
+
+## `:set`
+
+The same options can be changed while editing, with Vim's syntax:
+
+| Command | Effect |
+|---|---|
+| `:set nu` / `:set number` | turn a boolean option on (here: show line numbers) |
+| `:set nonu` / `:set nonumber` | turn it off |
+| `:set nu!` / `:set invnu` | toggle it |
+| `:set nu?` | show its value (`number` or `nonumber`) |
+| `:set ts=4` / `:set ts:4` | set a number option |
+| `:set ts` / `:set ts?` | show a number option |
+| `:set nu&` | back to the default |
+| `:set nu rnu ts=2` | several at once |
+| `:set` | list the options that differ from the defaults |
+
+`:se` is short for `:set`. Errors use Vim's codes (`E518: Unknown option`).
 
 ## `raster.g`
 

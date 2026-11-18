@@ -29,6 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Lua function right-hand sides. Half-typed mappings wait `timeoutlen`.
 - `raster.cmd`, `raster.feedkeys` and `raster.notify` (and `print`) for Lua
   functions.
+- `:set` with Vim's syntax: `:set nu` / `:set number` shows line numbers,
+  plus `nonu`, `nu!`, `invnu`, `nu?`, `nu&`, `ts=4` and several at once.
+  Short option names also work in `raster.opt`.
 - Line-number gutter, tabs drawn at `tabstop` width, `<Tab>` in Insert mode,
   and autoindent on `Enter`.
 - Vim's `t{char}` / `T{char}` (till) and `S`.
