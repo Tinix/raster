@@ -2,4 +2,5 @@
 
 pub mod motion;
 pub mod ops;
+pub mod parser;
 pub mod textobj;
