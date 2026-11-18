@@ -86,6 +86,7 @@ Everything here takes a count (`3w`, `5t`, `2dd`, `d3w`, `2d3w` = 6 words).
 | `<leader>q` | `:q` quit | done (default mapping; refuses if unsaved) |
 | `<leader>Q` | `:qa!` quit all, discard changes | done (default mapping; single buffer, acts as `:q!`) |
 | `:w` `:q` `:q!` `:qa!` `:wq` `:x` | ex-commands | done |
+| `:set nu` `:set nonu` `:set ts=4` … | set options (see [config.md](config.md)) | done |
 
 ## Lines and indent
 
