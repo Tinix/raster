@@ -15,5 +15,6 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0.104"
 crossterm = "0.29.0"
+mlua = { version = "0.12.2", features = ["luajit", "vendored"] }
 ratatui = "0.30.2"
 ropey = "1.6.1"
