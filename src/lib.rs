@@ -7,3 +7,4 @@ pub mod app;
 pub mod buffer;
 pub mod command;
 pub mod mode;
+pub mod ui;
