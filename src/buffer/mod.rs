@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use ropey::Rope;
-use std::{fs, ops::Range, path::PathBuf};
+use std::{collections::VecDeque, fs, ops::Range, path::PathBuf};
 
 #[derive(Debug, Default)]
 pub struct Buffer {
@@ -15,7 +15,15 @@ pub struct Buffer {
     last_version: u64,
     /// Version that was last written to disk.
     saved_version: u64,
+    /// Counts every change, undo and redo included (never goes back).
+    seq: u64,
+    /// Recent changes as (seq, first line touched), for incremental
+    /// consumers like the syntax highlighter.
+    changes: VecDeque<(u64, usize)>,
 }
+
+/// How many recent changes [`Buffer::first_change_since`] remembers.
+const CHANGE_LOG: usize = 256;
 
 impl Buffer {
     pub fn open(path: Option<String>) -> Result<Self> {
@@ -62,11 +70,42 @@ impl Buffer {
         self.version
     }
 
-    /// Record that the text changed.
-    fn touch(&mut self) {
+    /// Record that the text changed from line `line` on.
+    fn touch(&mut self, line: usize) {
         self.last_version += 1;
         self.version = self.last_version;
         self.dirty = true;
+        self.log_change(line);
+    }
+
+    fn log_change(&mut self, line: usize) {
+        self.seq += 1;
+        if self.changes.len() == CHANGE_LOG {
+            self.changes.pop_front();
+        }
+        self.changes.push_back((self.seq, line));
+    }
+
+    /// Change counter: different values mean the text may differ.
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// First line that may have changed since change `seq`: `None` if
+    /// nothing changed, `Some(0)` if the log no longer goes back that far.
+    pub fn first_change_since(&self, seq: u64) -> Option<usize> {
+        if seq >= self.seq {
+            return None;
+        }
+        match self.changes.front() {
+            Some((oldest, _)) if *oldest <= seq + 1 => self
+                .changes
+                .iter()
+                .filter(|(s, _)| *s > seq)
+                .map(|(_, line)| *line)
+                .min(),
+            _ => Some(0),
+        }
     }
 
     /// Put back text from an earlier `version` (used by undo/redo).
@@ -74,6 +113,7 @@ impl Buffer {
         self.text = text;
         self.version = version;
         self.dirty = version != self.saved_version;
+        self.log_change(0);
     }
 
     /// Insert `s` at char index `idx`.
@@ -81,8 +121,9 @@ impl Buffer {
         if s.is_empty() {
             return;
         }
+        let line = self.text.char_to_line(idx);
         self.text.insert(idx, s);
-        self.touch();
+        self.touch(line);
     }
 
     /// Remove the chars in `range` and return them.
@@ -91,8 +132,9 @@ impl Buffer {
             return String::new();
         }
         let removed = self.text.slice(range.clone()).to_string();
+        let line = self.text.char_to_line(range.start);
         self.text.remove(range);
-        self.touch();
+        self.touch(line);
         removed
     }
 
@@ -154,7 +196,7 @@ impl Buffer {
     pub fn insert_char(&mut self, row: usize, col: usize, ch: char) {
         let idx = self.text.line_to_char(row) + col;
         self.text.insert_char(idx, ch);
-        self.touch();
+        self.touch(row);
     }
 
     pub fn backspace(&mut self, row: usize, col: usize) -> (usize, usize) {
@@ -168,7 +210,7 @@ impl Buffer {
             (row, col - 1)
         };
         self.text.remove(idx - 1..idx);
-        self.touch();
+        self.touch(new.0);
         new
     }
 }
@@ -259,6 +301,37 @@ mod tests {
         // A new edit never reuses an old version.
         b.insert(0, "y");
         assert_ne!(b.version(), v0);
+    }
+
+    #[test]
+    fn change_log_reports_the_first_changed_line() {
+        let mut b = Buffer::default();
+        b.insert(0, "a\nb\nc\nd");
+        let seq = b.seq();
+        assert_eq!(b.first_change_since(seq), None);
+        b.insert_char(3, 0, 'x');
+        b.insert_char(2, 0, 'y');
+        assert_eq!(b.first_change_since(seq), Some(2));
+        let seq = b.seq();
+        b.backspace(1, 0);
+        assert_eq!(b.first_change_since(seq), Some(0));
+        let seq = b.seq();
+        b.restore(ropey::Rope::from_str("z"), 0);
+        assert_eq!(b.first_change_since(seq), Some(0));
+    }
+
+    #[test]
+    fn change_log_forgets_old_changes() {
+        let mut b = Buffer::default();
+        b.insert(0, "a\nb");
+        let seq = b.seq();
+        for _ in 0..CHANGE_LOG + 1 {
+            b.insert_char(1, 0, 'x');
+        }
+        // Too old: assume everything changed.
+        assert_eq!(b.first_change_since(seq), Some(0));
+        let seq = b.seq() - 1;
+        assert_eq!(b.first_change_since(seq), Some(1));
     }
 
     #[test]

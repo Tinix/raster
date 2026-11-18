@@ -327,19 +327,28 @@ impl SyntaxSet {
 /// Caches the lexer state at the start of each line.
 #[derive(Debug, Default)]
 pub struct Highlighter {
+    /// Buffer change counter and syntax the cache is for.
     key: Option<(u64, String)>,
     /// `states[r]` is the state at the start of line `r`.
     states: Vec<State>,
 }
 
 impl Highlighter {
-    /// Highlights of line `row`. Lines above it are lexed once per buffer
-    /// version; after an edit the cache starts over.
+    /// Highlights of line `row`. Lines above it are lexed once; after an
+    /// edit, only the lines from the first changed one are lexed again.
     pub fn line(&mut self, syntax: &Syntax, buf: &Buffer, row: usize) -> Highlights {
-        let key = (buf.version(), syntax.name.clone());
-        if self.key.as_ref() != Some(&key) {
-            self.key = Some(key);
-            self.states = vec![None];
+        match &self.key {
+            Some((seq, name)) if *name == syntax.name => {
+                if let Some(line) = buf.first_change_since(*seq) {
+                    // The state at the start of the changed line still holds.
+                    self.states.truncate(line + 1);
+                }
+            }
+            _ => self.states.clear(),
+        }
+        self.key = Some((buf.seq(), syntax.name.clone()));
+        if self.states.is_empty() {
+            self.states.push(None);
         }
         while self.states.len() <= row {
             let r = self.states.len() - 1;
@@ -349,6 +358,11 @@ impl Highlighter {
         syntax
             .highlight_line(&line_chars(buf, row), self.states[row])
             .0
+    }
+
+    /// Lines whose start state is cached (for tests).
+    pub fn cached_lines(&self) -> usize {
+        self.states.len()
     }
 }
 
@@ -626,5 +640,25 @@ mod tests {
             hl(&s, "func (s *T) Start()"),
             "func (s *T) [Function:Start]()"
         );
+    }
+
+    #[test]
+    fn highlighter_reuses_states_above_an_edit() {
+        let s = rusty();
+        let mut b = Buffer::default();
+        b.insert(0, &"fn x\n".repeat(100));
+        let mut h = Highlighter::default();
+        h.line(&s, &b, 99);
+        assert_eq!(h.cached_lines(), 100);
+        b.insert_char(90, 0, 'y');
+        h.line(&s, &b, 95);
+        assert_eq!(h.cached_lines(), 96);
+        // Another syntax starts over.
+        let other = Syntax {
+            name: "other".into(),
+            ..Syntax::default()
+        };
+        h.line(&other, &b, 3);
+        assert_eq!(h.cached_lines(), 4);
     }
 }
