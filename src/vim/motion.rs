@@ -33,6 +33,10 @@ pub enum Motion {
     FindForward(char),
     /// `F{char}`.
     FindBackward(char),
+    /// `t{char}`: just before the char.
+    TillForward(char),
+    /// `T{char}`: just after the char.
+    TillBackward(char),
 }
 
 /// How an operator uses the span between the cursor and the target.
@@ -51,7 +55,7 @@ impl Motion {
         use Motion::*;
         match self {
             Up | Down | FileStart | FileEnd => MotionKind::Linewise,
-            WordEnd { .. } | FindForward(_) => MotionKind::Inclusive,
+            WordEnd { .. } | FindForward(_) | TillForward(_) => MotionKind::Inclusive,
             // `$` lands just past the last char, so exclusive covers the line
             // without touching its newline, even on an empty line.
             Left
@@ -61,7 +65,8 @@ impl Motion {
             | LineEnd
             | WordForward { .. }
             | WordBackward { .. }
-            | FindBackward(_) => MotionKind::Exclusive,
+            | FindBackward(_)
+            | TillBackward(_) => MotionKind::Exclusive,
         }
     }
 
@@ -116,6 +121,14 @@ impl Motion {
                     .filter(|&i| buf.char_at(i) == Some(ch))
                     .nth(n - 1)
                     .map(|i| buf.idx_to_pos(i))
+            }
+            Motion::TillForward(ch) => {
+                let (r, c) = Motion::FindForward(ch).apply(buf, (row, col), count)?;
+                Some((r, c - 1))
+            }
+            Motion::TillBackward(ch) => {
+                let (r, c) = Motion::FindBackward(ch).apply(buf, (row, col), count)?;
+                Some((r, c + 1))
             }
         }
     }
@@ -361,6 +374,26 @@ mod tests {
             Some((0, 3))
         );
         assert_eq!(go(s, Motion::FindBackward('a'), (0, 0), None), None);
+    }
+
+    #[test]
+    fn till_forward_and_backward() {
+        let s = "a,b,c,d";
+        assert_eq!(go(s, Motion::TillForward(','), (0, 0), None), Some((0, 0)));
+        assert_eq!(go(s, Motion::TillForward('c'), (0, 0), None), Some((0, 3)));
+        assert_eq!(
+            go(s, Motion::TillForward(','), (0, 0), Some(2)),
+            Some((0, 2))
+        );
+        assert_eq!(go(s, Motion::TillForward('z'), (0, 0), None), None);
+        assert_eq!(go(s, Motion::TillBackward('a'), (0, 6), None), Some((0, 1)));
+        assert_eq!(
+            go(s, Motion::TillBackward(','), (0, 6), Some(2)),
+            Some((0, 4))
+        );
+        assert_eq!(go(s, Motion::TillBackward('a'), (0, 0), None), None);
+        assert_eq!(Motion::TillForward('x').kind(), MotionKind::Inclusive);
+        assert_eq!(Motion::TillBackward('x').kind(), MotionKind::Exclusive);
     }
 
     #[test]
