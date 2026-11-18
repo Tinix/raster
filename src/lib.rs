@@ -3,5 +3,8 @@
 //! The binary (`ras`) is a thin wrapper around this library, which keeps
 //! the editor core testable without a terminal.
 
+pub mod app;
 pub mod buffer;
+pub mod command;
 pub mod mode;
+pub mod ui;

@@ -21,7 +21,11 @@ impl Buffer {
         } else {
             Rope::new()
         };
-        Ok(Self { text, path: Some(p), dirty: false })
+        Ok(Self {
+            text,
+            path: Some(p),
+            dirty: false,
+        })
     }
 
     pub fn save(&mut self) -> Result<()> {
@@ -33,16 +37,18 @@ impl Buffer {
         Ok(())
     }
 
-
     pub fn line_count(&self) -> usize {
         self.text.len_lines()
     }
 
-
     pub fn line_len(&self, row: usize) -> usize {
         let line = self.text.line(row);
         let len = line.len_chars();
-        if len > 0 && line.char(len - 1) == '\n' { len - 1 } else { len }
+        if len > 0 && line.char(len - 1) == '\n' {
+            len - 1
+        } else {
+            len
+        }
     }
 
     pub fn insert_char(&mut self, row: usize, col: usize, ch: char) {
@@ -65,7 +71,6 @@ impl Buffer {
         self.dirty = true;
         new
     }
-
 }
 
 #[cfg(test)]
@@ -91,7 +96,6 @@ mod tests {
         assert_eq!(reopened.text.to_string(), "hello\nworld\n");
         std::fs::remove_file(path).unwrap();
     }
-
 
     #[test]
     fn line_len_ignores_newline() {
