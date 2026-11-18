@@ -20,6 +20,7 @@ use ratatui::{
     DefaultTerminal, Frame,
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     layout::{Constraint, Layout, Position},
+    style::{Color, Style},
     text::Line,
     widgets::Paragraph,
 };
@@ -272,8 +273,15 @@ impl App {
             return;
         };
         let cur = ops::apply(&mut self.buffer, &mut self.register, op, span, cur);
+        let mut cur = cur;
         if op == Operator::Change {
             self.mode = Mode::Insert;
+            // `cc` keeps the indent only with 'autoindent'.
+            if target == Target::Lines && !self.options.borrow().autoindent {
+                let start = self.buffer.pos_to_idx(cur.0, 0);
+                self.buffer.remove(start..start + cur.1);
+                cur.1 = 0;
+            }
         }
         self.set_cursor(cur);
     }
@@ -345,8 +353,11 @@ impl App {
             InsertAt::LineStart => self.col = self.buffer.first_non_blank(row),
             InsertAt::LineEnd => self.col = self.buffer.line_len(row),
             InsertAt::LineBelow | InsertAt::LineAbove => {
-                // Copy the current line's indent, like nvim's autoindent.
-                let indent = self.indent(row);
+                let indent = if self.options.borrow().autoindent {
+                    self.indent(row)
+                } else {
+                    String::new()
+                };
                 if at == InsertAt::LineBelow {
                     let idx = self.buffer.line_end(row);
                     self.buffer.insert(idx, &format!("\n{indent}"));
@@ -383,10 +394,38 @@ impl App {
                 self.want_col = self.col;
             }
             KeyCode::Enter => {
-                self.buffer.insert_char(self.row, self.col, '\n');
+                let mut indent = String::new();
+                if self.options.borrow().autoindent {
+                    indent = self.indent(self.row);
+                    indent.truncate(
+                        indent
+                            .char_indices()
+                            .nth(self.col)
+                            .map_or(indent.len(), |(i, _)| i),
+                    );
+                }
+                let idx = self.buffer.pos_to_idx(self.row, self.col);
+                self.buffer.insert(idx, &format!("\n{indent}"));
                 self.row += 1;
-                self.col = 0;
-                self.want_col = 0;
+                self.col = indent.chars().count();
+                self.want_col = self.col;
+            }
+            KeyCode::Tab => {
+                let (expand, tabstop) = {
+                    let o = self.options.borrow();
+                    (o.expandtab, o.tabstop)
+                };
+                let text = if expand {
+                    let line = self.line_text(self.row);
+                    let width = ui::display_col(&line, self.col, tabstop);
+                    " ".repeat(tabstop - width % tabstop)
+                } else {
+                    "\t".to_owned()
+                };
+                let idx = self.buffer.pos_to_idx(self.row, self.col);
+                self.buffer.insert(idx, &text);
+                self.col += text.chars().count();
+                self.want_col = self.col;
             }
             KeyCode::Backspace => {
                 (self.row, self.col) = self.buffer.backspace(self.row, self.col);
@@ -520,12 +559,25 @@ impl App {
     }
 
     /// Keep the cursor row inside the visible window of `height` lines.
+    /// Keep the cursor row inside the visible window of `height` lines,
+    /// with 'scrolloff' lines of context when possible.
     fn scroll_to_cursor(&mut self, height: usize) {
-        if self.row < self.scroll {
-            self.scroll = self.row;
-        } else if height > 0 && self.row >= self.scroll + height {
-            self.scroll = self.row + 1 - height;
+        if height == 0 {
+            return;
         }
+        let so = self.options.borrow().scrolloff.min((height - 1) / 2);
+        let last_top = self.buffer.line_count().saturating_sub(height);
+        if self.row < self.scroll + so {
+            self.scroll = self.row.saturating_sub(so);
+        } else if self.row + so >= self.scroll + height {
+            self.scroll = (self.row + so + 1 - height).min(last_top.max(self.scroll));
+        }
+    }
+
+    /// Text of `row` without its line break.
+    fn line_text(&self, row: usize) -> String {
+        let start = self.buffer.pos_to_idx(row, 0);
+        self.buffer.slice(start..self.buffer.line_end(row))
     }
 
     fn draw(&mut self, frame: &mut Frame) {
@@ -537,14 +589,31 @@ impl App {
         .areas(frame.area());
         self.scroll_to_cursor(text_area.height as usize);
 
-        let lines: Vec<Line> = (self.scroll..self.buffer.line_count())
-            .take(text_area.height as usize)
-            .map(|r| {
-                let line = self.buffer.text.line(r).to_string();
-                Line::raw(line.trim_end_matches(['\n', '\r']).to_owned())
-            })
+        let opts = self.options.borrow().clone();
+        let gutter = ui::gutter_width(opts.number, opts.relativenumber, self.buffer.line_count());
+        let [gutter_area, text_area] =
+            Layout::horizontal([Constraint::Length(gutter as u16), Constraint::Min(1)])
+                .areas(text_area);
+
+        let rows = self.scroll
+            ..self
+                .buffer
+                .line_count()
+                .min(self.scroll + text_area.height as usize);
+        let lines: Vec<Line> = rows
+            .clone()
+            .map(|r| Line::raw(ui::expand_tabs(&self.line_text(r), opts.tabstop)))
             .collect();
         frame.render_widget(Paragraph::new(lines), text_area);
+        if gutter > 0 {
+            let numbers: Vec<Line> = rows
+                .map(|r| {
+                    let n = ui::line_number(r, self.row, opts.number, opts.relativenumber, gutter);
+                    Line::styled(n, Style::default().fg(Color::DarkGray))
+                })
+                .collect();
+            frame.render_widget(Paragraph::new(numbers), gutter_area);
+        }
 
         let name = self.file_name();
         let status = Status {
@@ -565,7 +634,8 @@ impl App {
             if let Some(msg) = &self.message {
                 frame.render_widget(Line::raw(msg.clone()), cmd_area);
             }
-            let x = text_area.x + self.col as u16;
+            let col = ui::display_col(&self.line_text(self.row), self.col, opts.tabstop);
+            let x = text_area.x + col as u16;
             let y = text_area.y + (self.row - self.scroll) as u16;
             frame.set_cursor_position(Position::new(x, y));
         }
@@ -1152,5 +1222,128 @@ mod tests {
         assert_eq!(a.row, 0);
         keys(&mut a, "c");
         assert_eq!(a.row, 0);
+    }
+
+    fn set_opt(a: &App, name: &str, v: crate::options::Value) {
+        a.options.borrow_mut().set(name, v).unwrap();
+    }
+
+    /// Draw on a `w`x`h` test terminal: (screen rows, cursor x, cursor y).
+    fn render(a: &mut App, w: u16, h: u16) -> (Vec<String>, u16, u16) {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| a.draw(f)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let rows = (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect();
+        let cur = t.get_cursor_position().unwrap();
+        (rows, cur.x, cur.y)
+    }
+
+    use crate::options::Value::{Bool, Int};
+
+    #[test]
+    fn number_gutter() {
+        let mut a = app("a\nb");
+        set_opt(&a, "number", Bool(true));
+        keys(&mut a, "t");
+        let (rows, x, y) = render(&mut a, 12, 4);
+        assert_eq!(rows[0], "  1 a       ");
+        assert_eq!(rows[1], "  2 b       ");
+        assert_eq!((x, y), (4, 1));
+
+        set_opt(&a, "relativenumber", Bool(true));
+        let (rows, ..) = render(&mut a, 12, 4);
+        assert_eq!(rows[0], "  1 a       ");
+        assert_eq!(rows[1], "  2 b       ");
+        set_opt(&a, "number", Bool(false));
+        let (rows, ..) = render(&mut a, 12, 4);
+        assert_eq!(rows[1], "  0 b       ");
+    }
+
+    #[test]
+    fn tabs_render_with_tabstop_and_cursor_follows() {
+        let mut a = app("\tx");
+        set_opt(&a, "tabstop", Int(4));
+        keys(&mut a, "s");
+        let (rows, x, _) = render(&mut a, 10, 3);
+        assert_eq!(rows[0], "    x     ");
+        assert_eq!(x, 4);
+    }
+
+    #[test]
+    fn scrolloff_keeps_context() {
+        let text: Vec<String> = (1..=20).map(|n| n.to_string()).collect();
+        let mut a = app(&text.join("\n"));
+        set_opt(&a, "scrolloff", Int(2));
+        // 5 text rows (7 minus status and command lines).
+        keys(&mut a, "4t");
+        render(&mut a, 10, 7);
+        assert_eq!(a.scroll, 2);
+        keys(&mut a, "G");
+        let (rows, _, y) = render(&mut a, 10, 7);
+        // Never scrolls past the last line.
+        assert_eq!(a.scroll, 15);
+        assert_eq!((rows[4].trim(), y), ("20", 4));
+        keys(&mut a, "n");
+        render(&mut a, 10, 7);
+        assert_eq!(a.scroll, 15);
+        keys(&mut a, "gg");
+        render(&mut a, 10, 7);
+        assert_eq!(a.scroll, 0);
+        // On a short window 'scrolloff' is capped to half the height.
+        keys(&mut a, "3t");
+        render(&mut a, 10, 6);
+        assert_eq!(a.scroll, 1);
+    }
+
+    #[test]
+    fn tab_key_with_and_without_expandtab() {
+        let mut a = app("");
+        keys(&mut a, "i");
+        press(&mut a, KeyCode::Tab);
+        assert_eq!(text(&a), "\t");
+        esc(&mut a);
+
+        let mut a = app("");
+        set_opt(&a, "expandtab", Bool(true));
+        set_opt(&a, "tabstop", Int(4));
+        keys(&mut a, "iab");
+        press(&mut a, KeyCode::Tab);
+        keys(&mut a, "c");
+        assert_eq!(text(&a), "ab  c");
+    }
+
+    #[test]
+    fn autoindent_on_enter_and_off() {
+        let mut a = app("    foo");
+        keys(&mut a, "A");
+        press(&mut a, KeyCode::Enter);
+        keys(&mut a, "bar");
+        esc(&mut a);
+        assert_eq!(text(&a), "    foo\n    bar");
+
+        let mut a = app("    foo");
+        set_opt(&a, "autoindent", Bool(false));
+        keys(&mut a, "A");
+        press(&mut a, KeyCode::Enter);
+        keys(&mut a, "x");
+        esc(&mut a);
+        keys(&mut a, "oy");
+        esc(&mut a);
+        keys(&mut a, "ggccz");
+        esc(&mut a);
+        assert_eq!(text(&a), "z\nx\ny");
+    }
+
+    #[test]
+    fn enter_inside_indent_keeps_only_what_is_before_the_cursor() {
+        let mut a = app("    foo");
+        keys(&mut a, "ss");
+        keys(&mut a, "i");
+        press(&mut a, KeyCode::Enter);
+        esc(&mut a);
+        assert_eq!(text(&a), "  \n    foo");
     }
 }
