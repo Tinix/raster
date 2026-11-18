@@ -3,8 +3,14 @@
 use crate::{
     buffer::Buffer,
     command::Command,
+    history::History,
     mode::Mode,
     ui::{self, Status},
+    vim::{
+        motion::Motion,
+        ops::{self, Operator, Register},
+        parser::{Cmd, InsertAt, Parser, Step, Target},
+    },
 };
 use anyhow::Result;
 use ratatui::{
@@ -15,8 +21,13 @@ use ratatui::{
     widgets::Paragraph,
 };
 
-/// Leader key, as in the user's nvim config (`vim.g.mapleader = " "`).
-pub const LEADER: char = ' ';
+/// The last change, kept for `.` repeat: the command plus the keys typed in
+/// the Insert session it started (if any).
+#[derive(Debug, Clone)]
+struct Change {
+    cmd: Cmd,
+    insert_keys: Vec<KeyEvent>,
+}
 
 /// The whole editor: one buffer, a cursor and the current mode.
 #[derive(Debug, Default)]
@@ -35,9 +46,18 @@ pub struct App {
     pub cmdline: String,
     /// Message shown on the bottom line (errors, "written", ...).
     pub message: Option<String>,
-    /// The leader key was pressed and we wait for the next key.
-    leader_pending: bool,
     pub should_quit: bool,
+    /// Normal-mode key parser (operator-pending state machine).
+    parser: Parser,
+    /// The unnamed register.
+    pub register: Register,
+    history: History,
+    last_change: Option<Change>,
+    /// The change that started the current Insert session, finished on Esc.
+    insert_change: Option<Cmd>,
+    insert_keys: Vec<KeyEvent>,
+    /// Replaying a change with `.`: don't record it again.
+    replaying: bool,
 }
 
 impl App {
@@ -63,61 +83,198 @@ impl App {
 
     pub fn handle_key(&mut self, key: KeyEvent) {
         match self.mode {
-            Mode::Normal => self.normal_key(key),
+            Mode::Normal => {
+                if let Step::Done(cmd) = self.parser.feed(key) {
+                    self.run_cmd(cmd);
+                }
+            }
             Mode::Insert => self.insert_key(key),
             Mode::Command => self.command_key(key),
         }
     }
 
+    fn cursor(&self) -> (usize, usize) {
+        (self.row, self.col)
+    }
+
+    fn set_cursor(&mut self, (row, col): (usize, usize)) {
+        self.row = row.min(self.buffer.line_count().saturating_sub(1));
+        self.col = col;
+        self.clamp_col();
+        self.want_col = self.col;
+    }
+
     // --- Normal ------------------------------------------------------------
 
-    fn normal_key(&mut self, key: KeyEvent) {
-        if std::mem::take(&mut self.leader_pending) {
-            match key.code {
-                KeyCode::Char('q') => self.execute(Command::Quit),
-                KeyCode::Char('Q') => self.execute(Command::ForceQuit),
-                _ => {}
-            }
-            return;
-        }
-
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        match key.code {
-            KeyCode::Char('s') if ctrl => self.execute(Command::Write),
-            KeyCode::Char(LEADER) => self.leader_pending = true,
-            // Dvorak motions: h left, t down, n up, s right.
-            KeyCode::Char('h') | KeyCode::Left => self.move_left(),
-            KeyCode::Char('t') | KeyCode::Down => self.move_down(),
-            KeyCode::Char('n') | KeyCode::Up => self.move_up(),
-            KeyCode::Char('s') | KeyCode::Right => self.move_right(),
-            KeyCode::Char('0') | KeyCode::Home => self.line_start(),
-            KeyCode::Char('$') | KeyCode::End => self.line_end(),
-            KeyCode::Char('i') => self.mode = Mode::Insert,
-            KeyCode::Char('a') => {
-                self.mode = Mode::Insert;
-                self.col = (self.col + 1).min(self.buffer.line_len(self.row));
-                self.want_col = self.col;
-            }
-            KeyCode::Char(':') => {
+    /// Run a parsed Normal-mode command.
+    pub fn run_cmd(&mut self, cmd: Cmd) {
+        match cmd {
+            Cmd::Move { motion, count } => self.move_cursor(motion, count),
+            Cmd::Undo { count } => self.undo(count, false),
+            Cmd::Redo { count } => self.undo(count, true),
+            Cmd::Repeat { count } => self.repeat(count),
+            Cmd::CommandLine => {
                 self.mode = Mode::Command;
                 self.cmdline.clear();
                 self.message = None;
             }
-            _ => {}
+            Cmd::Ex(c) => self.execute(c),
+            Cmd::Operate {
+                op: Operator::Yank,
+                count,
+                target,
+            } => self.operate(Operator::Yank, count, target),
+            change => self.change(change),
         }
+    }
+
+    /// Run a command that edits the buffer as one undo step, and remember
+    /// it for `.`. If it starts an Insert session, the step and the record
+    /// are finished when Insert ends.
+    fn change(&mut self, cmd: Cmd) {
+        self.history.checkpoint(&self.buffer, self.cursor());
+        match cmd {
+            Cmd::Operate { op, count, target } => self.operate(op, count, target),
+            Cmd::Insert(at) => self.start_insert(at),
+            Cmd::Put { before, count } => {
+                let cur = self.cursor();
+                let cur = ops::put(&mut self.buffer, &self.register, cur, before, count);
+                self.set_cursor(cur);
+            }
+            _ => unreachable!("not a change: {cmd:?}"),
+        }
+        if self.mode == Mode::Insert {
+            if !self.replaying {
+                self.insert_change = Some(cmd);
+                self.insert_keys.clear();
+            }
+        } else {
+            self.history.discard_if_unchanged(&self.buffer);
+            if !self.replaying {
+                self.last_change = Some(Change {
+                    cmd,
+                    insert_keys: Vec::new(),
+                });
+            }
+        }
+    }
+
+    fn operate(&mut self, op: Operator, count: Option<usize>, target: Target) {
+        let cur = self.cursor();
+        let span = match target {
+            Target::Motion(m) => ops::motion_span(&self.buffer, op, cur, m, count),
+            Target::Object(obj) => ops::object_span(&self.buffer, cur, obj, count),
+            Target::Lines => Some(ops::lines_span(&self.buffer, cur, count)),
+        };
+        let Some(span) = span else {
+            return;
+        };
+        let cur = ops::apply(&mut self.buffer, &mut self.register, op, span, cur);
+        if op == Operator::Change {
+            self.mode = Mode::Insert;
+        }
+        self.set_cursor(cur);
+    }
+
+    fn move_cursor(&mut self, motion: Motion, count: Option<usize>) {
+        let Some((row, col)) = motion.apply(&self.buffer, self.cursor(), count) else {
+            return;
+        };
+        self.row = row;
+        match motion {
+            Motion::Up | Motion::Down => self.col = self.want_col.min(self.max_col()),
+            Motion::LineEnd => {
+                self.col = self.max_col();
+                self.want_col = usize::MAX;
+            }
+            _ => self.set_cursor((row, col)),
+        }
+    }
+
+    /// `u` (or `<C-r>` with `redo`), `count` times.
+    fn undo(&mut self, count: Option<usize>, redo: bool) {
+        for _ in 0..count.unwrap_or(1).max(1) {
+            let cur = if redo {
+                self.history.redo(&mut self.buffer)
+            } else {
+                self.history.undo(&mut self.buffer)
+            };
+            match cur {
+                Some(cur) => self.set_cursor(cur),
+                None => {
+                    let edge = if redo { "newest" } else { "oldest" };
+                    self.message = Some(format!("Already at {edge} change"));
+                    break;
+                }
+            }
+        }
+    }
+
+    /// `.`: replay the last change, with a new count if one is given.
+    fn repeat(&mut self, count: Option<usize>) {
+        let Some(change) = self.last_change.clone() else {
+            return;
+        };
+        let cmd = match count {
+            Some(_) => change.cmd.clone().with_count(count),
+            None => change.cmd.clone(),
+        };
+        self.replaying = true;
+        self.change(cmd.clone());
+        if self.mode == Mode::Insert {
+            for key in &change.insert_keys {
+                self.insert_key(*key);
+            }
+            self.insert_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        }
+        self.replaying = false;
+        // Like Vim, a count given to `.` sticks for the next `.`.
+        self.last_change = Some(Change { cmd, ..change });
     }
 
     // --- Insert ------------------------------------------------------------
 
-    fn insert_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Esc => {
-                self.mode = Mode::Normal;
-                // Like Vim, leaving Insert steps back onto the last typed char.
-                self.col = self.col.saturating_sub(1);
-                self.clamp_col();
-                self.want_col = self.col;
+    fn start_insert(&mut self, at: InsertAt) {
+        self.mode = Mode::Insert;
+        let row = self.row;
+        match at {
+            InsertAt::Cursor => {}
+            InsertAt::After => self.col = (self.col + 1).min(self.buffer.line_len(row)),
+            InsertAt::LineStart => self.col = self.buffer.first_non_blank(row),
+            InsertAt::LineEnd => self.col = self.buffer.line_len(row),
+            InsertAt::LineBelow | InsertAt::LineAbove => {
+                // Copy the current line's indent, like nvim's autoindent.
+                let indent = self.indent(row);
+                if at == InsertAt::LineBelow {
+                    let idx = self.buffer.line_end(row);
+                    self.buffer.insert(idx, &format!("\n{indent}"));
+                    self.row += 1;
+                } else {
+                    let idx = self.buffer.pos_to_idx(row, 0);
+                    self.buffer.insert(idx, &format!("{indent}\n"));
+                }
+                self.col = indent.chars().count();
             }
+        }
+        self.want_col = self.col;
+    }
+
+    /// Leading white space of `row`.
+    fn indent(&self, row: usize) -> String {
+        let start = self.buffer.pos_to_idx(row, 0);
+        self.buffer
+            .slice(start..start + self.buffer.first_non_blank(row))
+    }
+
+    fn insert_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Esc {
+            self.finish_insert();
+            return;
+        }
+        if self.insert_change.is_some() {
+            self.insert_keys.push(key);
+        }
+        match key.code {
             KeyCode::Char(c) => {
                 self.buffer.insert_char(self.row, self.col, c);
                 self.col += 1;
@@ -133,13 +290,34 @@ impl App {
                 (self.row, self.col) = self.buffer.backspace(self.row, self.col);
                 self.want_col = self.col;
             }
-            KeyCode::Left => self.move_left(),
-            KeyCode::Down => self.move_down(),
-            KeyCode::Up => self.move_up(),
-            KeyCode::Right => self.move_right(),
-            KeyCode::Home => self.line_start(),
-            KeyCode::End => self.line_end(),
-            _ => {}
+            code => {
+                let motion = match code {
+                    KeyCode::Left => Motion::Left,
+                    KeyCode::Down => Motion::Down,
+                    KeyCode::Up => Motion::Up,
+                    KeyCode::Right => Motion::Right,
+                    KeyCode::Home => Motion::LineStart,
+                    KeyCode::End => Motion::LineEnd,
+                    _ => return,
+                };
+                self.move_cursor(motion, None);
+            }
+        }
+    }
+
+    /// Leave Insert: close the undo step and record the change for `.`.
+    fn finish_insert(&mut self) {
+        self.mode = Mode::Normal;
+        // Like Vim, leaving Insert steps back onto the last typed char.
+        self.col = self.col.saturating_sub(1);
+        self.clamp_col();
+        self.want_col = self.col;
+        self.history.discard_if_unchanged(&self.buffer);
+        if let Some(cmd) = self.insert_change.take() {
+            self.last_change = Some(Change {
+                cmd,
+                insert_keys: std::mem::take(&mut self.insert_keys),
+            });
         }
     }
 
@@ -225,40 +403,6 @@ impl App {
 
     fn clamp_col(&mut self) {
         self.col = self.col.min(self.max_col());
-    }
-
-    fn move_left(&mut self) {
-        self.col = self.col.saturating_sub(1);
-        self.want_col = self.col;
-    }
-
-    fn move_right(&mut self) {
-        self.col = (self.col + 1).min(self.max_col());
-        self.want_col = self.col;
-    }
-
-    fn move_down(&mut self) {
-        if self.row + 1 < self.buffer.line_count() {
-            self.row += 1;
-            self.col = self.want_col.min(self.max_col());
-        }
-    }
-
-    fn move_up(&mut self) {
-        if self.row > 0 {
-            self.row -= 1;
-            self.col = self.want_col.min(self.max_col());
-        }
-    }
-
-    fn line_start(&mut self) {
-        self.col = 0;
-        self.want_col = 0;
-    }
-
-    fn line_end(&mut self) {
-        self.col = self.max_col();
-        self.want_col = usize::MAX;
     }
 
     // --- Drawing -----------------------------------------------------------
@@ -539,5 +683,268 @@ mod tests {
             a.message.as_deref(),
             Some("E492: Not an editor command: foo")
         );
+    }
+
+    fn text(a: &App) -> String {
+        a.buffer.text.to_string()
+    }
+
+    fn esc(a: &mut App) {
+        press(a, KeyCode::Esc);
+    }
+
+    fn ctrl(a: &mut App, c: char) {
+        a.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn counted_motions() {
+        let mut a = app("one two three four\nb\nc\nd\ne\nf\ng");
+        keys(&mut a, "3w");
+        assert_eq!((a.row, a.col), (0, 14));
+        keys(&mut a, "2b");
+        assert_eq!((a.row, a.col), (0, 4));
+        keys(&mut a, "e");
+        assert_eq!((a.row, a.col), (0, 6));
+        keys(&mut a, "5t");
+        assert_eq!(a.row, 5);
+        keys(&mut a, "3n");
+        assert_eq!(a.row, 2);
+    }
+
+    #[test]
+    fn file_motions() {
+        let mut a = app("one\n  two\nthree\nfour");
+        keys(&mut a, "G");
+        assert_eq!((a.row, a.col), (3, 0));
+        keys(&mut a, "gg");
+        assert_eq!((a.row, a.col), (0, 0));
+        keys(&mut a, "2G");
+        assert_eq!((a.row, a.col), (1, 2));
+        keys(&mut a, "3gg");
+        assert_eq!(a.row, 2);
+    }
+
+    #[test]
+    fn caret_and_find() {
+        let mut a = app("   foo(a, b)");
+        keys(&mut a, "$^");
+        assert_eq!(a.col, 3);
+        keys(&mut a, "f,");
+        assert_eq!(a.col, 8);
+        keys(&mut a, "F(");
+        assert_eq!(a.col, 6);
+    }
+
+    #[test]
+    fn w_past_the_last_word_stays_on_the_last_char() {
+        let mut a = app("ab cd");
+        keys(&mut a, "5w");
+        assert_eq!(a.col, 4);
+    }
+
+    #[test]
+    fn insert_entries() {
+        let mut a = app("  foo");
+        keys(&mut a, "$Ix");
+        esc(&mut a);
+        assert_eq!(text(&a), "  xfoo");
+        keys(&mut a, "Ay");
+        esc(&mut a);
+        assert_eq!(text(&a), "  xfooy");
+        keys(&mut a, "obar");
+        esc(&mut a);
+        assert_eq!(text(&a), "  xfooy\n  bar");
+        keys(&mut a, "Obaz");
+        esc(&mut a);
+        assert_eq!(text(&a), "  xfooy\n  baz\n  bar");
+        assert_eq!(a.row, 1);
+    }
+
+    #[test]
+    fn delete_change_yank_and_put() {
+        let mut a = app("foo bar baz");
+        keys(&mut a, "wdw");
+        assert_eq!(text(&a), "foo baz");
+        keys(&mut a, "P");
+        assert_eq!(text(&a), "foo bar baz");
+
+        keys(&mut a, "0ciwqux");
+        esc(&mut a);
+        assert_eq!(text(&a), "qux bar baz");
+        assert_eq!(a.mode, Mode::Normal);
+
+        keys(&mut a, "$D");
+        assert_eq!(text(&a), "qux bar ba");
+        keys(&mut a, "0Cnew");
+        esc(&mut a);
+        assert_eq!(text(&a), "new");
+        keys(&mut a, "0x");
+        assert_eq!(text(&a), "ew");
+        assert_eq!(a.register.text, "n");
+    }
+
+    #[test]
+    fn dd_yy_and_linewise_put() {
+        let mut a = app("a\nb\nc");
+        keys(&mut a, "dd");
+        assert_eq!(text(&a), "b\nc");
+        keys(&mut a, "p");
+        assert_eq!(text(&a), "b\na\nc");
+        assert_eq!(a.row, 1);
+        keys(&mut a, "yyGp");
+        assert_eq!(text(&a), "b\na\nc\na");
+        keys(&mut a, "gg2dd");
+        assert_eq!(text(&a), "c\na");
+        keys(&mut a, "cct");
+        esc(&mut a);
+        assert_eq!(text(&a), "t\na");
+    }
+
+    #[test]
+    fn cw_then_typing() {
+        let mut a = app("foo bar");
+        keys(&mut a, "cwqux");
+        esc(&mut a);
+        assert_eq!(text(&a), "qux bar");
+    }
+
+    #[test]
+    fn undo_and_redo() {
+        let mut a = app("a b c");
+        keys(&mut a, "dwdw");
+        assert_eq!(text(&a), "c");
+        keys(&mut a, "u");
+        assert_eq!(text(&a), "b c");
+        keys(&mut a, "u");
+        assert_eq!(text(&a), "a b c");
+        keys(&mut a, "u");
+        assert_eq!(a.message.as_deref(), Some("Already at oldest change"));
+        ctrl(&mut a, 'r');
+        assert_eq!(text(&a), "b c");
+        keys(&mut a, "2u");
+        assert_eq!(text(&a), "a b c");
+        ctrl(&mut a, 'r');
+        ctrl(&mut a, 'r');
+        assert_eq!(text(&a), "c");
+    }
+
+    #[test]
+    fn insert_session_is_one_undo_step() {
+        let mut a = app("x");
+        keys(&mut a, "ahello");
+        press(&mut a, KeyCode::Enter);
+        keys(&mut a, "world");
+        esc(&mut a);
+        assert_eq!(text(&a), "xhello\nworld");
+        keys(&mut a, "u");
+        assert_eq!(text(&a), "x");
+        assert_eq!((a.row, a.col), (0, 0));
+        // `cw` plus the typing is one step too.
+        keys(&mut a, "cwyz");
+        esc(&mut a);
+        keys(&mut a, "u");
+        assert_eq!(text(&a), "x");
+    }
+
+    #[test]
+    fn empty_insert_and_failed_motion_leave_no_undo_step() {
+        let mut a = app("a b");
+        keys(&mut a, "dw");
+        keys(&mut a, "i");
+        esc(&mut a);
+        keys(&mut a, "dfz");
+        keys(&mut a, "u");
+        assert_eq!(text(&a), "a b");
+    }
+
+    #[test]
+    fn undo_back_to_saved_state_is_clean() {
+        let mut a = app("abc");
+        keys(&mut a, "x");
+        assert!(a.buffer.dirty);
+        keys(&mut a, "u");
+        assert!(!a.buffer.dirty);
+    }
+
+    #[test]
+    fn yank_is_not_undoable_or_repeatable() {
+        let mut a = app("a b");
+        keys(&mut a, "x");
+        keys(&mut a, "yw");
+        keys(&mut a, "u");
+        assert_eq!(text(&a), "a b");
+        keys(&mut a, "yw.");
+        assert_eq!(text(&a), " b");
+    }
+
+    #[test]
+    fn dot_repeats_operator() {
+        let mut a = app("a b c d e");
+        keys(&mut a, "dw..");
+        assert_eq!(text(&a), "d e");
+        // A count on `.` replaces the original count and sticks.
+        let mut a = app("a b c d e f");
+        keys(&mut a, "dw2.");
+        assert_eq!(text(&a), "d e f");
+        keys(&mut a, ".");
+        assert_eq!(text(&a), "f");
+    }
+
+    #[test]
+    fn dot_repeats_change_with_typed_text() {
+        let mut a = app("foo bar");
+        keys(&mut a, "ciwX");
+        esc(&mut a);
+        keys(&mut a, "w.");
+        assert_eq!(text(&a), "X X");
+    }
+
+    #[test]
+    fn dot_repeats_insert_entries() {
+        let mut a = app("a\nb");
+        keys(&mut a, "A;");
+        esc(&mut a);
+        keys(&mut a, "t.");
+        assert_eq!(text(&a), "a;\nb;");
+
+        let mut a = app("x");
+        keys(&mut a, "o-");
+        esc(&mut a);
+        keys(&mut a, ".");
+        assert_eq!(text(&a), "x\n-\n-");
+    }
+
+    #[test]
+    fn dot_repeats_x_dd_and_put() {
+        let mut a = app("abcdef");
+        keys(&mut a, "2x.");
+        assert_eq!(text(&a), "ef");
+
+        let mut a = app("1\n2\n3\n4");
+        keys(&mut a, "dd.");
+        assert_eq!(text(&a), "3\n4");
+
+        let mut a = app("a");
+        keys(&mut a, "yyp.");
+        assert_eq!(text(&a), "a\na\na");
+    }
+
+    #[test]
+    fn each_dot_is_one_undo_step() {
+        let mut a = app("foo bar");
+        keys(&mut a, "ciwX");
+        esc(&mut a);
+        keys(&mut a, "w.u");
+        assert_eq!(text(&a), "X bar");
+    }
+
+    #[test]
+    fn operator_pending_esc_cancels() {
+        let mut a = app("abc");
+        keys(&mut a, "d");
+        esc(&mut a);
+        keys(&mut a, "s");
+        assert_eq!((text(&a).as_str(), a.col), ("abc", 1));
     }
 }
