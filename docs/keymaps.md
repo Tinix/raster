@@ -9,37 +9,49 @@ brings each one in.
 `<Space>` itself does nothing in Normal mode.
 
 Status: **done** = in Raster today; **step N** = planned for roadmap step N;
-**later** = wanted but not on a step yet; **not yet** = blocked on the
-`t`/`n`/`s` conflict above.
+**later** = wanted but not on a step yet.
 
 Roadmap steps: 1 skeleton · 2 operators, motions, undo/redo ·
-3 `init.lua` / `raster.keymap` · 4 Lua themes · 5 buffers, tabs, splits,
+3 `init.lua` / `raster.keymap` (done) · 4 Lua themes · 5 buffers, tabs, splits,
 status bar · 6 pickers (fzf + ripgrep) · 7 floating terminal · 8 flow.
 
-## Dvorak motions (Normal and Visual)
+## How Raster's keys are layered
 
-nvim remaps `t`/`n`/`s` to `j`/`k`/`l`, so Vim's original `t` (till),
-`n` (next match) and `s` (substitute) are shadowed in Normal and Visual mode.
+Like nvim, Raster has two layers:
 
-| nvim key | Action | Raster |
+1. **Vim's built-in keys** (`h j k l`, `t` = till, `n` = next match,
+   `s` = substitute, ...), handled by the key parser.
+2. **Mappings** on top of them. Raster's defaults are the mappings from the
+   nvim config below. `init.lua` can change or delete any of them
+   (`raster.keymap.set` / `raster.keymap.del`, see [config.md](config.md)).
+
+Mappings are per mode, so a Normal-mode mapping does not apply after an
+operator: `dt,` is Vim's "delete till `,`", exactly as in nvim.
+
+## Dvorak motions (default mappings)
+
+| nvim mapping | Modes | Action | Raster |
+|---|---|---|---|
+| `h` → `h` | n, v | left | done (built-in `h`) |
+| `t` → `j` | n, v | down | done (n) · v stored until Visual mode |
+| `n` → `k` | n, v | up | done (n) · v stored until Visual mode |
+| `s` → `l` | n, v | right | done (n) · v stored until Visual mode |
+| `<Space>` → `<Nop>` | n, v | leader only | done |
+
+Because the maps are Normal and Visual only:
+
+| Key | In Normal mode | After an operator (`d`, `c`, `y`) |
 |---|---|---|
-| `h` | left | done (Normal, with operators) · later (Visual) |
-| `t` | down (`j`) | done (Normal, with operators) · later (Visual) |
-| `n` | up (`k`) | done (Normal, with operators) · later (Visual) |
-| `s` | right (`l`) | done (Normal, with operators) · later (Visual) |
-| arrows | move (built-in) | done (Normal and Insert) |
-
-**Operator-pending note.** The nvim config remaps `h t n s` only in Normal
-and Visual mode (`"n"`, `"v"`), not in operator-pending mode (`"o"`). So in
-nvim, `dt,` is still Vim's "delete till `,`". Raster uses the Dvorak motions
-after operators too: `dt` deletes the current line and the one below (like
-`dj`), and `ds` deletes one char (like `dl`). Until the conflict is decided,
-Vim's till (`t`/`T`), next match (`n`/`N`) and substitute (`s`) are not
-available.
+| `t` | down (mapped) | till char: `dt,` (built-in) |
+| `T` | till char backward (built-in, not mapped) | same |
+| `n` | up (mapped) | next match: not implemented yet (search) |
+| `s` | right (mapped) | nothing (Vim has no `s` motion) |
+| `S` | change whole line (built-in, not mapped) | — |
 
 ## Vim editing core (built-ins, step 2)
 
 Everything here takes a count (`3w`, `5t`, `2dd`, `d3w`, `2d3w` = 6 words).
+`j` / `k` / `l` also work in Normal mode, like in nvim.
 
 | Key | Action | Raster |
 |---|---|---|
@@ -47,6 +59,7 @@ Everything here takes a count (`3w`, `5t`, `2dd`, `d3w`, `2d3w` = 6 words).
 | `0` `^` `$` | line start, first non-blank, line end | done |
 | `gg` / `G` / `{count}G` | first line / last line / line N | done |
 | `f{char}` / `F{char}` | find char forward / backward on the line | done |
+| `t{char}` / `T{char}` | till char forward / backward (`t` only after an operator, see above) | done (step 3) |
 | `i` `a` `I` `A` | Insert at cursor, after, first non-blank, line end | done |
 | `o` / `O` | open line below / above (keeps indent) | done |
 | `Esc` | back to Normal | done |
@@ -55,13 +68,13 @@ Everything here takes a count (`3w`, `5t`, `2dd`, `d3w`, `2d3w` = 6 words).
 | `iw` `aw` / `iW` `aW` | inner / a word or WORD (`diw`, `caw`) | done |
 | `dd` `cc` `yy` | delete, change (keeps indent), yank lines | done |
 | `x` / `D` / `C` | `dl` / `d$` / `c$` | done |
+| `S` | `cc` (`s` is the Dvorak right) | done (step 3) |
 | `p` / `P` | put after / before (unnamed register) | done |
 | `.` | repeat last change, a count replaces its count | done |
 | `u` / `<C-r>` | undo / redo; each Insert session is one step | done |
 | `:` | Command mode | done |
-| `t` `T` `;` `,` | till char, repeat find | not yet (`t` conflict) |
-| `n` `N` `/` `?` | search | not yet (`n` conflict) |
-| `s` | substitute char | not yet (`s` conflict) |
+| `;` `,` | repeat last `f` `F` `t` `T` | later |
+| `/` `?` `n` `N` | search (`n` is up in Normal mode, as in nvim) | later |
 | `v` `V` | Visual mode | later |
 | `"{reg}` | named registers; nvim uses `clipboard=unnamedplus` | later |
 
@@ -69,10 +82,11 @@ Everything here takes a count (`3w`, `5t`, `2dd`, `d3w`, `2d3w` = 6 words).
 
 | nvim key | Action | Raster |
 |---|---|---|
-| `<C-s>` | `:w` save file | done |
-| `<leader>q` | `:q` quit | done (refuses if unsaved, like `:q`) |
-| `<leader>Q` | `:qa!` quit all, discard changes | done (single buffer, acts as `:q!`) |
+| `<C-s>` | `:w` save file | done (default mapping) |
+| `<leader>q` | `:q` quit | done (default mapping; refuses if unsaved) |
+| `<leader>Q` | `:qa!` quit all, discard changes | done (default mapping; single buffer, acts as `:q!`) |
 | `:w` `:q` `:q!` `:qa!` `:wq` `:x` | ex-commands | done |
+| `:set nu` `:set nonu` `:set ts=4` … | set options (see [config.md](config.md)) | done |
 
 ## Lines and indent
 
@@ -116,8 +130,8 @@ nvim config, unlike the Dvorak `htns` motions. Raster keeps them as-is.
 ## Plugin-only mappings (not planned)
 
 These belong to nvim plugins that cover features Raster leaves out (Git UI,
-AI chat, LSP completion). Users can rebind them later with `raster.keymap`
-(step 3) if a plugin provides the feature.
+AI chat, LSP completion). Users can bind them with `raster.keymap` if a
+plugin provides the feature.
 
 | nvim key | Action |
 |---|---|

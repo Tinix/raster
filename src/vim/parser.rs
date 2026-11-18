@@ -1,11 +1,13 @@
 //! Parser: the Normal-mode state machine that turns keys into commands.
 //!
-//! Grammar (the same as Vim's):
+//! These are Vim's built-in keys (`h j k l`, `t` = till, `s` = substitute).
+//! Raster's Dvorak motions are default mappings on top of them, see
+//! [`crate::keymap`]. Grammar (the same as Vim's):
 //!
 //! ```text
 //! command  = [count] ( motion | simple | operator [count] target )
 //! target   = motion | "i" object | "a" object | <operator key again>
-//! motion   = h t n s 0 ^ $ w b e W B E G | "gg" | ("f" | "F") char
+//! motion   = h j k l 0 ^ $ w b e W B E G | "gg" | ("f" | "F" | "t" | "T") char
 //! ```
 //!
 //! Feed keys one at a time with [`Parser::feed`]. It answers
@@ -15,7 +17,7 @@
 //! the tables below.
 
 use super::{motion::Motion, ops::Operator, textobj::TextObject};
-use crate::command::Command;
+use crate::keymap::MapMode;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// What an operator acts on.
@@ -75,8 +77,6 @@ pub enum Cmd {
     },
     /// `:`
     CommandLine,
-    /// An ex-command bound to a key (`<C-s>`, `<leader>q`).
-    Ex(Command),
 }
 
 impl Cmd {
@@ -118,16 +118,11 @@ enum Pending {
     None,
     /// After `g`.
     G,
-    /// After `f` (forward) or `F`.
-    Find { forward: bool },
+    /// After `f`, `F` (`till` = false) or `t`, `T` (`till` = true).
+    Find { forward: bool, till: bool },
     /// After `i` or `a` in operator-pending mode.
     Object { inner: bool },
-    /// After the leader key.
-    Leader,
 }
-
-/// Leader key, from the nvim config (`vim.g.mapleader = " "`).
-pub const LEADER: char = ' ';
 
 #[derive(Debug, Default)]
 pub struct Parser {
@@ -143,6 +138,16 @@ impl Parser {
     /// Whether a command is half typed (for the status bar later on).
     pub fn is_pending(&self) -> bool {
         self.count.is_some() || self.op.is_some() || self.pending != Pending::None
+    }
+
+    /// Which mappings apply to the next key, or `None` while a char
+    /// argument is expected (`f{char}`, `t{char}`, `iw`), which is never remapped.
+    pub fn map_mode(&self) -> Option<MapMode> {
+        match self.pending {
+            Pending::Find { .. } | Pending::Object { .. } => None,
+            _ if self.op.is_some() => Some(MapMode::OperatorPending),
+            _ => Some(MapMode::Normal),
+        }
     }
 
     pub fn feed(&mut self, key: KeyEvent) -> Step {
@@ -171,12 +176,16 @@ impl Parser {
                     _ => Step::Cancel,
                 };
             }
-            Pending::Find { forward } => {
-                return match ch {
-                    Some(c) if forward => self.motion(Motion::FindForward(c)),
-                    Some(c) => self.motion(Motion::FindBackward(c)),
-                    None => Step::Cancel,
+            Pending::Find { forward, till } => {
+                let Some(c) = ch else {
+                    return Step::Cancel;
                 };
+                return self.motion(match (forward, till) {
+                    (true, false) => Motion::FindForward(c),
+                    (false, false) => Motion::FindBackward(c),
+                    (true, true) => Motion::TillForward(c),
+                    (false, true) => Motion::TillBackward(c),
+                });
             }
             Pending::Object { inner } => {
                 return match ch.and_then(|c| object_key(c, inner)) {
@@ -184,18 +193,10 @@ impl Parser {
                     None => Step::Cancel,
                 };
             }
-            Pending::Leader => {
-                return match ch {
-                    Some('q') => Step::Done(Cmd::Ex(Command::Quit)),
-                    Some('Q') => Step::Done(Cmd::Ex(Command::ForceQuit)),
-                    _ => Step::Cancel,
-                };
-            }
         }
 
         if ctrl {
             return match ch {
-                Some('s') => Step::Done(Cmd::Ex(Command::Write)),
                 Some('r') if self.op.is_none() => Step::Done(Cmd::Redo { count: self.count }),
                 _ => Step::Cancel,
             };
@@ -226,8 +227,12 @@ impl Parser {
         };
         match c {
             'g' => return self.wait(Pending::G),
-            'f' => return self.wait(Pending::Find { forward: true }),
-            'F' => return self.wait(Pending::Find { forward: false }),
+            'f' | 'F' | 't' | 'T' => {
+                return self.wait(Pending::Find {
+                    forward: c.is_lowercase(),
+                    till: c.eq_ignore_ascii_case(&'t'),
+                });
+            }
             _ => {}
         }
 
@@ -250,6 +255,12 @@ impl Parser {
             'x' => done(op_cmd(Operator::Delete, count, Motion::Right)),
             'D' => done(op_cmd(Operator::Delete, count, Motion::LineEnd)),
             'C' => done(op_cmd(Operator::Change, count, Motion::LineEnd)),
+            's' => done(op_cmd(Operator::Change, count, Motion::Right)),
+            'S' => done(Cmd::Operate {
+                op: Operator::Change,
+                count,
+                target: Target::Lines,
+            }),
             'p' => done(Cmd::Put {
                 before: false,
                 count,
@@ -261,7 +272,6 @@ impl Parser {
             'u' => done(Cmd::Undo { count }),
             '.' => done(Cmd::Repeat { count }),
             ':' => done(Cmd::CommandLine),
-            LEADER => self.wait(Pending::Leader),
             c => match insert_key(c) {
                 Some(at) => done(Cmd::Insert(at)),
                 None => Step::Cancel,
@@ -313,14 +323,14 @@ fn op_cmd(op: Operator, count: Option<usize>, motion: Motion) -> Cmd {
     }
 }
 
-/// Motion keys. `h t n s` are the Dvorak `h j k l` from the nvim config.
+/// Motion keys (Vim's built-ins; the Dvorak `t n s` are mappings).
 fn motion_key(code: KeyCode) -> Option<Motion> {
     use Motion::*;
     Some(match code {
-        KeyCode::Char('h') | KeyCode::Left => Left,
-        KeyCode::Char('t') | KeyCode::Down => Down,
-        KeyCode::Char('n') | KeyCode::Up => Up,
-        KeyCode::Char('s') | KeyCode::Right => Right,
+        KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => Left,
+        KeyCode::Char('j') | KeyCode::Down => Down,
+        KeyCode::Char('k') | KeyCode::Up => Up,
+        KeyCode::Char('l') | KeyCode::Char(' ') | KeyCode::Right => Right,
         KeyCode::Char('0') | KeyCode::Home => LineStart,
         KeyCode::Char('^') => FirstNonBlank,
         KeyCode::Char('$') | KeyCode::End => LineEnd,
@@ -399,10 +409,12 @@ mod tests {
     fn motions_and_counts() {
         assert_eq!(done("w"), mv(W, None));
         assert_eq!(done("3w"), mv(W, Some(3)));
-        assert_eq!(done("5t"), mv(Motion::Down, Some(5)));
-        assert_eq!(done("12n"), mv(Motion::Up, Some(12)));
+        assert_eq!(done("5j"), mv(Motion::Down, Some(5)));
+        assert_eq!(done("12k"), mv(Motion::Up, Some(12)));
         assert_eq!(done("h"), mv(Motion::Left, None));
-        assert_eq!(done("s"), mv(Motion::Right, None));
+        assert_eq!(done("l"), mv(Motion::Right, None));
+        // `<Space>` moves right, as in Vim (the default keymap makes it `<Nop>`).
+        assert_eq!(done(" "), mv(Motion::Right, None));
         assert_eq!(done("E"), mv(Motion::WordEnd { big: true }, None));
         assert_eq!(done("^"), mv(Motion::FirstNonBlank, None));
     }
@@ -455,9 +467,68 @@ mod tests {
             op(Operator::Delete, None, Target::Motion(Motion::FileStart))
         );
         assert_eq!(
-            done("dt"),
+            done("dj"),
             op(Operator::Delete, None, Target::Motion(Motion::Down))
         );
+    }
+
+    #[test]
+    fn till_is_vim_builtin() {
+        assert_eq!(done("t,"), mv(Motion::TillForward(','), None));
+        assert_eq!(done("2T("), mv(Motion::TillBackward('('), Some(2)));
+        assert_eq!(
+            done("dt,"),
+            op(
+                Operator::Delete,
+                None,
+                Target::Motion(Motion::TillForward(','))
+            )
+        );
+        assert_eq!(
+            done("cT "),
+            op(
+                Operator::Change,
+                None,
+                Target::Motion(Motion::TillBackward(' '))
+            )
+        );
+    }
+
+    #[test]
+    fn substitute() {
+        assert_eq!(
+            done("s"),
+            op(Operator::Change, None, Target::Motion(Motion::Right))
+        );
+        assert_eq!(
+            done("3s"),
+            op(Operator::Change, Some(3), Target::Motion(Motion::Right))
+        );
+        assert_eq!(done("S"), op(Operator::Change, None, Target::Lines));
+    }
+
+    #[test]
+    fn search_keys_are_not_implemented_yet() {
+        assert_eq!(parse("n"), Step::Cancel);
+        assert_eq!(parse("N"), Step::Cancel);
+        assert_eq!(parse("dn"), Step::Cancel);
+    }
+
+    #[test]
+    fn map_mode_follows_parser_state() {
+        let mut p = Parser::default();
+        let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        assert_eq!(p.map_mode(), Some(MapMode::Normal));
+        p.feed(key('2'));
+        assert_eq!(p.map_mode(), Some(MapMode::Normal));
+        p.feed(key('d'));
+        assert_eq!(p.map_mode(), Some(MapMode::OperatorPending));
+        p.feed(key('t'));
+        assert_eq!(p.map_mode(), None);
+        p.feed(key(','));
+        assert_eq!(p.map_mode(), Some(MapMode::Normal));
+        p.feed(key('f'));
+        assert_eq!(p.map_mode(), None);
     }
 
     #[test]
@@ -554,14 +625,12 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_keys_and_leader() {
+    fn ctrl_keys() {
         let mut p = Parser::default();
         let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
         assert_eq!(p.feed(ctrl('r')), Step::Done(Cmd::Redo { count: None }));
-        assert_eq!(p.feed(ctrl('s')), Step::Done(Cmd::Ex(Command::Write)));
-        assert_eq!(done(" q"), Cmd::Ex(Command::Quit));
-        assert_eq!(done(" Q"), Cmd::Ex(Command::ForceQuit));
-        assert_eq!(parse(" z"), Step::Cancel);
+        // `<C-s>` is a default mapping, not a built-in.
+        assert_eq!(p.feed(ctrl('s')), Step::Cancel);
     }
 
     #[test]

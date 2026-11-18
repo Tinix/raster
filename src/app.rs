@@ -3,8 +3,12 @@
 use crate::{
     buffer::Buffer,
     command::Command,
+    config::{Action, Config},
     history::History,
+    keymap::{Keymap, MapMode, Match, Rhs},
+    keys::{self, Key},
     mode::Mode,
+    options::Options,
     ui::{self, Status},
     vim::{
         motion::Motion,
@@ -17,8 +21,14 @@ use ratatui::{
     DefaultTerminal, Frame,
     crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     layout::{Constraint, Layout, Position},
+    style::{Color, Style},
     text::Line,
     widgets::Paragraph,
+};
+use std::{
+    cell::RefCell,
+    rc::Rc,
+    time::{Duration, Instant},
 };
 
 /// The last change, kept for `.` repeat: the command plus the keys typed in
@@ -58,6 +68,16 @@ pub struct App {
     insert_keys: Vec<KeyEvent>,
     /// Replaying a change with `.`: don't record it again.
     replaying: bool,
+    /// Key mappings, shared with the Lua config.
+    pub keymap: Rc<RefCell<Keymap>>,
+    /// Editor options, shared with the Lua config.
+    pub options: Rc<RefCell<Options>>,
+    /// Typed keys that may still become a mapping.
+    pending_keys: Vec<Key>,
+    /// When the first pending key was typed (for `timeoutlen`).
+    pending_since: Option<Instant>,
+    /// Lua runtime for `init.lua` and Lua mappings.
+    config: Option<Config>,
 }
 
 impl App {
@@ -72,6 +92,13 @@ impl App {
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         while !self.should_quit {
             terminal.draw(|f| self.draw(f))?;
+            // While a mapping is half typed, wait at most `timeoutlen`.
+            if let Some(wait) = self.map_timeout()
+                && !event::poll(wait)?
+            {
+                self.resolve_pending(true);
+                continue;
+            }
             if let Event::Key(key) = event::read()?
                 && key.kind == KeyEventKind::Press
             {
@@ -81,7 +108,133 @@ impl App {
         Ok(())
     }
 
+    /// Time left before a half-typed mapping resolves, if one is pending.
+    pub fn map_timeout(&self) -> Option<Duration> {
+        let since = self.pending_since?;
+        let total = Duration::from_millis(self.options.borrow().timeoutlen);
+        Some(total.saturating_sub(since.elapsed()))
+    }
+
+    /// Mappings that apply to the next key, if any.
+    fn map_mode(&self) -> Option<MapMode> {
+        match self.mode {
+            Mode::Normal => self.parser.map_mode(),
+            Mode::Insert => Some(MapMode::Insert),
+            Mode::Command => None,
+        }
+    }
+
+    /// Handle a typed key: match it against the keymap, then run it.
     pub fn handle_key(&mut self, key: KeyEvent) {
+        if self.map_mode().is_none() && self.pending_keys.is_empty() {
+            self.dispatch(key);
+            return;
+        }
+        self.pending_keys.push(Key::from(key));
+        self.pending_since.get_or_insert_with(Instant::now);
+        self.resolve_pending(false);
+    }
+
+    /// Turn pending keys into mappings or plain keys until they are used up
+    /// or form the start of a longer mapping. `timed_out` stops waiting.
+    pub fn resolve_pending(&mut self, mut timed_out: bool) {
+        while !self.pending_keys.is_empty() {
+            let Some(mode) = self.map_mode() else {
+                let key = self.pending_keys.remove(0);
+                self.dispatch(key.event());
+                continue;
+            };
+            let found = self
+                .keymap
+                .borrow()
+                .matches(mode, &self.pending_keys, timed_out);
+            match found {
+                Match::Wait => return,
+                Match::Mapped { rhs, len } => {
+                    self.pending_keys.drain(..len);
+                    self.run_rhs(rhs);
+                }
+                Match::Unmapped => {
+                    let key = self.pending_keys.remove(0);
+                    self.dispatch(key.event());
+                }
+            }
+            timed_out = false;
+        }
+        self.pending_since = None;
+    }
+
+    /// Run a mapping's right-hand side. Its keys are not remapped.
+    fn run_rhs(&mut self, rhs: Rhs) {
+        match rhs {
+            Rhs::Keys(tokens) => {
+                let keys = self.keymap.borrow().resolve(&tokens);
+                self.feed_keys(&keys);
+            }
+            Rhs::Lua(id) => self.call_lua(id),
+        }
+    }
+
+    /// Feed keys as if typed, without mappings.
+    pub fn feed_keys(&mut self, keys: &[Key]) {
+        for key in keys {
+            self.dispatch(key.event());
+        }
+    }
+
+    /// Start the Lua runtime and run the config file at `path`, if any.
+    /// Errors end up on the message line; the editor starts anyway.
+    pub fn load_config(&mut self, path: Option<&std::path::Path>) {
+        let config = match Config::new(self.options.clone(), self.keymap.clone()) {
+            Ok(c) => c,
+            Err(e) => {
+                self.message = Some(format!("Lua: {e}"));
+                return;
+            }
+        };
+        let result = path.map_or(Ok(()), |p| config.load_file(p));
+        self.config = Some(config);
+        self.apply_lua_actions();
+        if let Err(e) = result {
+            self.message = Some(e);
+        }
+    }
+
+    /// Call a Lua mapping, then apply what it asked for.
+    fn call_lua(&mut self, id: usize) {
+        let result = match &self.config {
+            Some(config) => config.call(id),
+            None => Err("no Lua runtime".into()),
+        };
+        self.apply_lua_actions();
+        if let Err(e) = result {
+            self.message = Some(e);
+        }
+    }
+
+    fn apply_lua_actions(&mut self) {
+        let actions = self
+            .config
+            .as_ref()
+            .map(Config::take_actions)
+            .unwrap_or_default();
+        for action in actions {
+            match action {
+                Action::Cmd(cmd) => self.execute(Command::parse(&cmd)),
+                Action::Feed(notation) => {
+                    let leader = self.keymap.borrow().leader;
+                    match keys::parse_keys(&notation, leader) {
+                        Ok(keys) => self.feed_keys(&keys),
+                        Err(e) => self.message = Some(e),
+                    }
+                }
+                Action::Notify(msg) => self.message = Some(msg),
+            }
+        }
+    }
+
+    /// Run a key without mappings.
+    fn dispatch(&mut self, key: KeyEvent) {
         match self.mode {
             Mode::Normal => {
                 if let Step::Done(cmd) = self.parser.feed(key) {
@@ -118,7 +271,6 @@ impl App {
                 self.cmdline.clear();
                 self.message = None;
             }
-            Cmd::Ex(c) => self.execute(c),
             Cmd::Operate {
                 op: Operator::Yank,
                 count,
@@ -170,8 +322,15 @@ impl App {
             return;
         };
         let cur = ops::apply(&mut self.buffer, &mut self.register, op, span, cur);
+        let mut cur = cur;
         if op == Operator::Change {
             self.mode = Mode::Insert;
+            // `cc` keeps the indent only with 'autoindent'.
+            if target == Target::Lines && !self.options.borrow().autoindent {
+                let start = self.buffer.pos_to_idx(cur.0, 0);
+                self.buffer.remove(start..start + cur.1);
+                cur.1 = 0;
+            }
         }
         self.set_cursor(cur);
     }
@@ -243,8 +402,11 @@ impl App {
             InsertAt::LineStart => self.col = self.buffer.first_non_blank(row),
             InsertAt::LineEnd => self.col = self.buffer.line_len(row),
             InsertAt::LineBelow | InsertAt::LineAbove => {
-                // Copy the current line's indent, like nvim's autoindent.
-                let indent = self.indent(row);
+                let indent = if self.options.borrow().autoindent {
+                    self.indent(row)
+                } else {
+                    String::new()
+                };
                 if at == InsertAt::LineBelow {
                     let idx = self.buffer.line_end(row);
                     self.buffer.insert(idx, &format!("\n{indent}"));
@@ -281,10 +443,38 @@ impl App {
                 self.want_col = self.col;
             }
             KeyCode::Enter => {
-                self.buffer.insert_char(self.row, self.col, '\n');
+                let mut indent = String::new();
+                if self.options.borrow().autoindent {
+                    indent = self.indent(self.row);
+                    indent.truncate(
+                        indent
+                            .char_indices()
+                            .nth(self.col)
+                            .map_or(indent.len(), |(i, _)| i),
+                    );
+                }
+                let idx = self.buffer.pos_to_idx(self.row, self.col);
+                self.buffer.insert(idx, &format!("\n{indent}"));
                 self.row += 1;
-                self.col = 0;
-                self.want_col = 0;
+                self.col = indent.chars().count();
+                self.want_col = self.col;
+            }
+            KeyCode::Tab => {
+                let (expand, tabstop) = {
+                    let o = self.options.borrow();
+                    (o.expandtab, o.tabstop)
+                };
+                let text = if expand {
+                    let line = self.line_text(self.row);
+                    let width = ui::display_col(&line, self.col, tabstop);
+                    " ".repeat(tabstop - width % tabstop)
+                } else {
+                    "\t".to_owned()
+                };
+                let idx = self.buffer.pos_to_idx(self.row, self.col);
+                self.buffer.insert(idx, &text);
+                self.col += text.chars().count();
+                self.want_col = self.col;
             }
             KeyCode::Backspace => {
                 (self.row, self.col) = self.buffer.backspace(self.row, self.col);
@@ -361,6 +551,13 @@ impl App {
                     self.should_quit = true;
                 }
             }
+            Command::Set(args) => {
+                let result = self.options.borrow_mut().set_from_ex(&args);
+                match result {
+                    Ok(shown) => self.message = shown,
+                    Err(e) => self.message = Some(e),
+                }
+            }
             Command::Unknown(s) if s.is_empty() => {}
             Command::Unknown(s) => {
                 self.message = Some(format!("E492: Not an editor command: {s}"));
@@ -418,12 +615,25 @@ impl App {
     }
 
     /// Keep the cursor row inside the visible window of `height` lines.
+    /// Keep the cursor row inside the visible window of `height` lines,
+    /// with 'scrolloff' lines of context when possible.
     fn scroll_to_cursor(&mut self, height: usize) {
-        if self.row < self.scroll {
-            self.scroll = self.row;
-        } else if height > 0 && self.row >= self.scroll + height {
-            self.scroll = self.row + 1 - height;
+        if height == 0 {
+            return;
         }
+        let so = self.options.borrow().scrolloff.min((height - 1) / 2);
+        let last_top = self.buffer.line_count().saturating_sub(height);
+        if self.row < self.scroll + so {
+            self.scroll = self.row.saturating_sub(so);
+        } else if self.row + so >= self.scroll + height {
+            self.scroll = (self.row + so + 1 - height).min(last_top.max(self.scroll));
+        }
+    }
+
+    /// Text of `row` without its line break.
+    fn line_text(&self, row: usize) -> String {
+        let start = self.buffer.pos_to_idx(row, 0);
+        self.buffer.slice(start..self.buffer.line_end(row))
     }
 
     fn draw(&mut self, frame: &mut Frame) {
@@ -435,14 +645,31 @@ impl App {
         .areas(frame.area());
         self.scroll_to_cursor(text_area.height as usize);
 
-        let lines: Vec<Line> = (self.scroll..self.buffer.line_count())
-            .take(text_area.height as usize)
-            .map(|r| {
-                let line = self.buffer.text.line(r).to_string();
-                Line::raw(line.trim_end_matches(['\n', '\r']).to_owned())
-            })
+        let opts = self.options.borrow().clone();
+        let gutter = ui::gutter_width(opts.number, opts.relativenumber, self.buffer.line_count());
+        let [gutter_area, text_area] =
+            Layout::horizontal([Constraint::Length(gutter as u16), Constraint::Min(1)])
+                .areas(text_area);
+
+        let rows = self.scroll
+            ..self
+                .buffer
+                .line_count()
+                .min(self.scroll + text_area.height as usize);
+        let lines: Vec<Line> = rows
+            .clone()
+            .map(|r| Line::raw(ui::expand_tabs(&self.line_text(r), opts.tabstop)))
             .collect();
         frame.render_widget(Paragraph::new(lines), text_area);
+        if gutter > 0 {
+            let numbers: Vec<Line> = rows
+                .map(|r| {
+                    let n = ui::line_number(r, self.row, opts.number, opts.relativenumber, gutter);
+                    Line::styled(n, Style::default().fg(Color::DarkGray))
+                })
+                .collect();
+            frame.render_widget(Paragraph::new(numbers), gutter_area);
+        }
 
         let name = self.file_name();
         let status = Status {
@@ -463,7 +690,8 @@ impl App {
             if let Some(msg) = &self.message {
                 frame.render_widget(Line::raw(msg.clone()), cmd_area);
             }
-            let x = text_area.x + self.col as u16;
+            let col = ui::display_col(&self.line_text(self.row), self.col, opts.tabstop);
+            let x = text_area.x + col as u16;
             let y = text_area.y + (self.row - self.scroll) as u16;
             frame.set_cursor_position(Position::new(x, y));
         }
@@ -946,5 +1174,361 @@ mod tests {
         esc(&mut a);
         keys(&mut a, "s");
         assert_eq!((text(&a).as_str(), a.col), ("abc", 1));
+    }
+
+    #[test]
+    fn dvorak_maps_apply_in_normal_but_not_after_operators() {
+        // `dt,` is Vim's "delete till", as in the nvim config.
+        let mut a = app("foo, bar\nnext");
+        keys(&mut a, "dt,");
+        assert_eq!(text(&a), ", bar\nnext");
+        // `t` alone still moves down, with counts too.
+        let mut a = app("a\nb\nc\nd");
+        keys(&mut a, "2t");
+        assert_eq!(a.row, 2);
+        keys(&mut a, "n");
+        assert_eq!(a.row, 1);
+    }
+
+    #[test]
+    fn vim_builtins_under_the_maps() {
+        let mut a = app("a(b, c)");
+        keys(&mut a, "$T(");
+        assert_eq!(a.col, 2);
+        keys(&mut a, "jkl");
+        assert_eq!(a.col, 3);
+        let mut a = app("abc\n  def");
+        keys(&mut a, "tSx");
+        esc(&mut a);
+        assert_eq!(text(&a), "abc\n  x");
+    }
+
+    #[test]
+    fn char_arguments_are_not_remapped() {
+        let mut a = app("xtx");
+        keys(&mut a, "ft");
+        assert_eq!(a.col, 1);
+        let mut a = app("a s b");
+        keys(&mut a, "dfs");
+        assert_eq!(text(&a), " b");
+    }
+
+    #[test]
+    fn command_line_is_not_remapped() {
+        let mut a = app("");
+        keys(&mut a, ":tns");
+        assert_eq!(a.cmdline, "tns");
+    }
+
+    #[test]
+    fn leader_waits_and_times_out() {
+        let mut a = app("abc");
+        keys(&mut a, " ");
+        assert!(a.map_timeout().is_some());
+        assert_eq!(a.col, 0);
+        a.resolve_pending(true);
+        // `<Space>` is `<Nop>`: the cursor did not move.
+        assert_eq!(a.col, 0);
+        assert!(a.map_timeout().is_none());
+        // A key that breaks the sequence runs `<Space>`, then itself.
+        keys(&mut a, " s");
+        assert_eq!(a.col, 1);
+    }
+
+    #[test]
+    fn user_mappings_override_defaults() {
+        let mut a = app("a\nb\nc");
+        a.keymap.borrow_mut().set_keys("n", "t", "G", None).unwrap();
+        keys(&mut a, "t");
+        assert_eq!(a.row, 2);
+        a.keymap
+            .borrow_mut()
+            .del(&[MapMode::Normal], &crate::keys::parse("t").unwrap())
+            .unwrap();
+        // Without the mapping, `t` is Vim's till again.
+        keys(&mut a, "gg");
+        a.buffer.insert(0, "x,");
+        keys(&mut a, "dt,");
+        assert_eq!(text(&a), ",a\nb\nc");
+    }
+
+    #[test]
+    fn insert_mode_mappings() {
+        let mut a = app("");
+        a.keymap
+            .borrow_mut()
+            .set_keys("i", "jk", "<Esc>", None)
+            .unwrap();
+        keys(&mut a, "ihijk");
+        assert_eq!(a.mode, Mode::Normal);
+        assert_eq!(text(&a), "hi");
+        // A lone `j` is typed after the timeout.
+        keys(&mut a, "aj");
+        assert_eq!(text(&a), "hi");
+        a.resolve_pending(true);
+        assert_eq!(text(&a), "hij");
+    }
+
+    #[test]
+    fn mapping_rhs_is_not_remapped() {
+        let mut a = app("a\nb\nc");
+        // `x` -> `t`: `t` must be Vim's till here, not the Dvorak `j`.
+        a.keymap.borrow_mut().set_keys("n", "x", "t", None).unwrap();
+        keys(&mut a, "x");
+        assert_eq!(a.row, 0);
+        keys(&mut a, "c");
+        assert_eq!(a.row, 0);
+    }
+
+    fn set_opt(a: &App, name: &str, v: crate::options::Value) {
+        a.options.borrow_mut().set(name, v).unwrap();
+    }
+
+    /// Draw on a `w`x`h` test terminal: (screen rows, cursor x, cursor y).
+    fn render(a: &mut App, w: u16, h: u16) -> (Vec<String>, u16, u16) {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| a.draw(f)).unwrap();
+        let buf = t.backend().buffer().clone();
+        let rows = (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect();
+        let cur = t.get_cursor_position().unwrap();
+        (rows, cur.x, cur.y)
+    }
+
+    use crate::options::Value::{Bool, Int};
+
+    #[test]
+    fn number_gutter() {
+        let mut a = app("a\nb");
+        set_opt(&a, "number", Bool(true));
+        keys(&mut a, "t");
+        let (rows, x, y) = render(&mut a, 12, 4);
+        assert_eq!(rows[0], "  1 a       ");
+        assert_eq!(rows[1], "  2 b       ");
+        assert_eq!((x, y), (4, 1));
+
+        set_opt(&a, "relativenumber", Bool(true));
+        let (rows, ..) = render(&mut a, 12, 4);
+        assert_eq!(rows[0], "  1 a       ");
+        assert_eq!(rows[1], "  2 b       ");
+        set_opt(&a, "number", Bool(false));
+        let (rows, ..) = render(&mut a, 12, 4);
+        assert_eq!(rows[1], "  0 b       ");
+    }
+
+    #[test]
+    fn tabs_render_with_tabstop_and_cursor_follows() {
+        let mut a = app("\tx");
+        set_opt(&a, "tabstop", Int(4));
+        keys(&mut a, "s");
+        let (rows, x, _) = render(&mut a, 10, 3);
+        assert_eq!(rows[0], "    x     ");
+        assert_eq!(x, 4);
+    }
+
+    #[test]
+    fn scrolloff_keeps_context() {
+        let text: Vec<String> = (1..=20).map(|n| n.to_string()).collect();
+        let mut a = app(&text.join("\n"));
+        set_opt(&a, "scrolloff", Int(2));
+        // 5 text rows (7 minus status and command lines).
+        keys(&mut a, "4t");
+        render(&mut a, 10, 7);
+        assert_eq!(a.scroll, 2);
+        keys(&mut a, "G");
+        let (rows, _, y) = render(&mut a, 10, 7);
+        // Never scrolls past the last line.
+        assert_eq!(a.scroll, 15);
+        assert_eq!((rows[4].trim(), y), ("20", 4));
+        keys(&mut a, "n");
+        render(&mut a, 10, 7);
+        assert_eq!(a.scroll, 15);
+        keys(&mut a, "gg");
+        render(&mut a, 10, 7);
+        assert_eq!(a.scroll, 0);
+        // On a short window 'scrolloff' is capped to half the height.
+        keys(&mut a, "3t");
+        render(&mut a, 10, 6);
+        assert_eq!(a.scroll, 1);
+    }
+
+    #[test]
+    fn tab_key_with_and_without_expandtab() {
+        let mut a = app("");
+        keys(&mut a, "i");
+        press(&mut a, KeyCode::Tab);
+        assert_eq!(text(&a), "\t");
+        esc(&mut a);
+
+        let mut a = app("");
+        set_opt(&a, "expandtab", Bool(true));
+        set_opt(&a, "tabstop", Int(4));
+        keys(&mut a, "iab");
+        press(&mut a, KeyCode::Tab);
+        keys(&mut a, "c");
+        assert_eq!(text(&a), "ab  c");
+    }
+
+    #[test]
+    fn autoindent_on_enter_and_off() {
+        let mut a = app("    foo");
+        keys(&mut a, "A");
+        press(&mut a, KeyCode::Enter);
+        keys(&mut a, "bar");
+        esc(&mut a);
+        assert_eq!(text(&a), "    foo\n    bar");
+
+        let mut a = app("    foo");
+        set_opt(&a, "autoindent", Bool(false));
+        keys(&mut a, "A");
+        press(&mut a, KeyCode::Enter);
+        keys(&mut a, "x");
+        esc(&mut a);
+        keys(&mut a, "oy");
+        esc(&mut a);
+        keys(&mut a, "ggccz");
+        esc(&mut a);
+        assert_eq!(text(&a), "z\nx\ny");
+    }
+
+    #[test]
+    fn enter_inside_indent_keeps_only_what_is_before_the_cursor() {
+        let mut a = app("    foo");
+        keys(&mut a, "ss");
+        keys(&mut a, "i");
+        press(&mut a, KeyCode::Enter);
+        esc(&mut a);
+        assert_eq!(text(&a), "  \n    foo");
+    }
+
+    fn with_config(text: &str, lua: &str) -> App {
+        let dir = std::env::temp_dir().join(format!(
+            "raster_app_cfg_{}_{}",
+            std::process::id(),
+            lua.len()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let init = dir.join("init.lua");
+        std::fs::write(&init, lua).unwrap();
+        let mut a = app(text);
+        a.load_config(Some(&init));
+        std::fs::remove_dir_all(dir).unwrap();
+        a
+    }
+
+    #[test]
+    fn init_lua_sets_options_and_maps() {
+        let mut a = with_config(
+            "a b c",
+            r#"
+            raster.g.mapleader = ","
+            raster.opt.number = true
+            raster.keymap.set("n", "<leader>d", "dw")
+            raster.keymap.set("i", "jk", "<Esc>")
+            "#,
+        );
+        assert!(a.options.borrow().number);
+        assert_eq!(a.message, None);
+        keys(&mut a, ",d");
+        assert_eq!(text(&a), "b c");
+        keys(&mut a, "ixjk");
+        assert_eq!((text(&a).as_str(), a.mode), ("xb c", Mode::Normal));
+        // Defaults now use the new leader too.
+        a.buffer.dirty = false;
+        keys(&mut a, ",q");
+        assert!(a.should_quit);
+    }
+
+    #[test]
+    fn lua_function_mappings_drive_the_editor() {
+        let mut a = with_config(
+            "one\ntwo",
+            r#"
+            raster.keymap.set("n", "<leader>x", function()
+              raster.feedkeys("dd")
+              raster.notify("deleted")
+            end)
+            raster.keymap.set("n", "Q", function() raster.cmd("q!") end)
+            raster.keymap.set("n", "E", function() error("nope") end)
+            "#,
+        );
+        keys(&mut a, " x");
+        assert_eq!(text(&a), "two");
+        assert_eq!(a.message.as_deref(), Some("deleted"));
+        keys(&mut a, "E");
+        assert_eq!(a.message.as_deref(), Some("init.lua:7: nope"));
+        keys(&mut a, "Q");
+        assert!(a.should_quit);
+    }
+
+    #[test]
+    fn init_lua_errors_show_but_keep_earlier_settings() {
+        let a = with_config(
+            "",
+            "raster.opt.number = true\nraster.opt.mouse = 'a'\nraster.opt.scrolloff = 5",
+        );
+        assert_eq!(
+            a.message.as_deref(),
+            Some("init.lua:2: unknown option 'mouse'")
+        );
+        assert!(a.options.borrow().number);
+        assert_eq!(a.options.borrow().scrolloff, 0);
+    }
+
+    #[test]
+    fn init_lua_can_restore_vim_keys() {
+        let mut a = with_config(
+            "x,y\nz",
+            r#"
+            for _, k in ipairs({ "t", "n", "s" }) do raster.keymap.del("n", k) end
+            "#,
+        );
+        keys(&mut a, "t,");
+        assert_eq!(a.col, 0);
+        keys(&mut a, "j");
+        assert_eq!(a.row, 1);
+        keys(&mut a, "ks");
+        assert_eq!(a.mode, Mode::Insert);
+    }
+
+    fn ex(a: &mut App, cmd: &str) {
+        keys(a, &format!(":{cmd}"));
+        press(a, KeyCode::Enter);
+    }
+
+    #[test]
+    fn set_number_from_the_command_line_shows_line_numbers() {
+        let mut a = app("one\ntwo");
+        let (rows, ..) = render(&mut a, 12, 4);
+        assert_eq!(rows[0], "one         ");
+
+        ex(&mut a, "set nu");
+        let (rows, x, _) = render(&mut a, 12, 4);
+        assert_eq!(rows[0], "  1 one     ");
+        assert_eq!(rows[1], "  2 two     ");
+        assert_eq!(x, 4);
+
+        ex(&mut a, "set nonumber");
+        let (rows, ..) = render(&mut a, 12, 4);
+        assert_eq!(rows[0], "one         ");
+
+        ex(&mut a, "set number");
+        assert!(a.options.borrow().number);
+        ex(&mut a, "se nu?");
+        assert_eq!(a.message.as_deref(), Some("  number"));
+        ex(&mut a, "set nu!");
+        assert!(!a.options.borrow().number);
+    }
+
+    #[test]
+    fn set_errors_show_on_the_message_line() {
+        let mut a = app("");
+        ex(&mut a, "set mouse=a");
+        assert_eq!(a.message.as_deref(), Some("E518: Unknown option: mouse=a"));
+        ex(&mut a, "set ts=4 rnu");
+        assert_eq!(a.options.borrow().tabstop, 4);
+        assert!(a.options.borrow().relativenumber);
     }
 }

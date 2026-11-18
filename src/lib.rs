@@ -6,7 +6,11 @@
 pub mod app;
 pub mod buffer;
 pub mod command;
+pub mod config;
 pub mod history;
+pub mod keymap;
+pub mod keys;
 pub mod mode;
+pub mod options;
 pub mod ui;
 pub mod vim;
