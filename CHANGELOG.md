@@ -19,6 +19,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `u` / `<C-r>` undo and redo; an Insert session is one undo step, and
   undoing back to the saved state clears the dirty marker.
 - Operator-pending key parser (`vim::parser`) that later steps can extend.
+- `init.lua` config, run with LuaJIT from `~/.config/raster/init.lua` (or
+  `$XDG_CONFIG_HOME/raster/`), with `require` from its `lua/` folder.
+  `ras --clean` skips it and `ras -u <file>` picks another one.
+- `raster.opt`: `number`, `relativenumber`, `scrolloff`, `tabstop`,
+  `shiftwidth`, `expandtab`, `autoindent` and `timeoutlen`.
+- `raster.g.mapleader`, and `raster.keymap.set` / `raster.keymap.del` for
+  Normal, Insert, Operator-pending and (stored) Visual mappings, with key or
+  Lua function right-hand sides. Half-typed mappings wait `timeoutlen`.
+- `raster.cmd`, `raster.feedkeys` and `raster.notify` (and `print`) for Lua
+  functions.
+- Line-number gutter, tabs drawn at `tabstop` width, `<Tab>` in Insert mode,
+  and autoindent on `Enter`.
+- Vim's `t{char}` / `T{char}` (till) and `S`.
 
 - `ras` binary: open a file (or an empty buffer) full screen in the terminal.
 - Rope-backed buffer with open, save, insert and backspace.
@@ -32,7 +45,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `docs/keymaps.md`: default keys taken from the author's nvim config, with
   the roadmap step for each.
 
+### Changed
+
+- The Dvorak motions `t` `n` `s`, `<C-s>` and `<Space>q` / `<Space>Q` are now
+  default mappings on top of Vim's keys, as in the author's nvim config. After
+  an operator, `t` is Vim's till (`dt,`), not down.
+
 ### Fixed
+
+- The cursor is placed correctly on lines with tabs.
 
 - The final newline of a file no longer shows up as an extra empty line.
   It is written back on save, like Vim.
