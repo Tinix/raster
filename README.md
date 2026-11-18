@@ -19,12 +19,48 @@ plus **flow**, a built-in plugin manager. Themes are plain Lua tables.
 
 Vim-style editing with Normal, Insert and Command modes, Dvorak-friendly
 default motions, and a Zellij-inspired interface: tab bar, colored status bar,
-key hints, panes and a floating terminal## Roadmap
+key hints, panes and a floating terminal.
+
+## Usage
+
+```sh
+cargo run --release -- path/to/file   # or: ras path/to/file
+```
+
+## Keys
+
+Defaults follow a Dvorak-friendly Vim layout. Leader is `<Space>`.
+The full mapping and what comes next is in [docs/keymaps.md](docs/keymaps.md).
+
+| Mode | Key | Action |
+|---|---|---|
+| Normal | `h` `t` `n` `s` / arrows | left, down, up, right |
+| Normal | `w` `b` `e` / `W` `B` `E` | word / WORD forward, back, end |
+| Normal | `0` `^` `$` | line start, first non-blank, line end |
+| Normal | `gg` / `G` / `{count}G` | first / last / Nth line |
+| Normal | `f{char}` / `F{char}` | find char forward / backward |
+| Normal | `i` `a` `I` `A` `o` `O` | enter Insert (cursor, after, line start/end, new line) |
+| Normal | `d` `c` `y` + motion or `iw` `aw` | delete, change, yank |
+| Normal | `dd` `cc` `yy`, `x` `D` `C` | linewise ops, delete char, to end of line |
+| Normal | `p` / `P` | put after / before |
+| Normal | `.` | repeat last change |
+| Normal | `u` / `<C-r>` | undo / redo |
+| Normal | `:` | Command mode |
+| Normal | `<C-s>` | save |
+| Normal | `<Space>q` / `<Space>Q` | quit / quit discarding changes |
+| Insert | any char, `Enter`, `Backspace` | type, break line, delete |
+| Insert | `Esc` | back to Normal |
+| Command | `:w` | write |
+| Command | `:q` / `:q!` | quit / quit discarding changes |
+| Command | `:wq` / `:x` | write and quit |
+| Command | `Esc` | cancel |
+
+Motions and operators take counts: `3w`, `5t`, `2dd`, `d3w`.
 
 ## Roadmap
 
-- [ ] Open/save files, Normal/Insert/Command modes, basic motions
-- [ ] Operators and motions (`dw`, `ciw`, `yy`, `p`), undo/redo
+- [x] Open/save files, Normal/Insert/Command modes, basic motions
+- [x] Operators and motions (`dw`, `ciw`, `yy`, `p`), undo/redo
 - [ ] `init.lua` with the `raster.opt` / `raster.keymap` API
 - [ ] Lua themes, starting with `raster-violet`
 - [ ] Buffers, tabs, splits and the status bar
