@@ -512,7 +512,7 @@ mod tests {
             press(&mut a, KeyCode::Enter);
             assert!(a.should_quit);
             assert!(!a.buffer.dirty);
-            assert_eq!(std::fs::read_to_string(&path).unwrap(), "hi");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "hi\n");
             std::fs::remove_file(path).unwrap();
         }
     }
@@ -526,7 +526,7 @@ mod tests {
         a.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
         assert!(!a.buffer.dirty);
         assert_eq!((a.row, a.col), (0, 1));
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "ok");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "ok\n");
         std::fs::remove_file(path).unwrap();
     }
 

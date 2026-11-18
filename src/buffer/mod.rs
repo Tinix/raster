@@ -17,7 +17,16 @@ impl Buffer {
             return Ok(Self::default());
         };
         let text = if p.exists() {
-            Rope::from_str(&fs::read_to_string(&p)?)
+            let mut s = fs::read_to_string(&p)?;
+            // Like Vim, the final newline terminates the last line instead of
+            // starting an empty one; `save` writes it back.
+            if s.ends_with('\n') {
+                s.pop();
+                if s.ends_with('\r') {
+                    s.pop();
+                }
+            }
+            Rope::from_str(&s)
         } else {
             Rope::new()
         };
@@ -32,7 +41,11 @@ impl Buffer {
         let Some(p) = &self.path else {
             anyhow::bail!("no file name");
         };
-        fs::write(p, self.text.to_string())?;
+        let mut out = self.text.to_string();
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        fs::write(p, out)?;
         self.dirty = false;
         Ok(())
     }
@@ -89,11 +102,13 @@ mod tests {
     fn save_and_reopen_roundtrip() {
         let path = std::env::temp_dir().join("raster_buffer_roundtrip.txt");
         let mut b = Buffer::open(Some(path.display().to_string())).unwrap();
-        b.text.insert(0, "hello\nworld\n");
+        b.text.insert(0, "hello\nworld");
         b.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\nworld\n");
 
         let reopened = Buffer::open(Some(path.display().to_string())).unwrap();
-        assert_eq!(reopened.text.to_string(), "hello\nworld\n");
+        assert_eq!(reopened.text.to_string(), "hello\nworld");
+        assert_eq!(reopened.line_count(), 2);
         std::fs::remove_file(path).unwrap();
     }
 
